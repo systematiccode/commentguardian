@@ -16,6 +16,8 @@ interface ConductEvent {
   flags: FlagType[];
   delta: number;
   createdAt: string; // ISO
+  commentSnippet?: string;
+  postTitle?: string;
 }
 
 const CONDUCT_USERS_KEY = 'conduct_users';
@@ -31,6 +33,8 @@ function conductEventsKeyForUser(username: string): string {
 // ---------- Settings ----------
 
 Devvit.addSettings([
+  // --- Scam accusations ---
+
   {
     type: 'string',
     name: 'scam_phrases',
@@ -40,6 +44,23 @@ Devvit.addSettings([
       'scammer,this is a scam,such a scam,you are scamming,youre scamming',
   },
   {
+    type: 'boolean',
+    name: 'enable_scam_flags',
+    label: 'Scam accusations: enable detection & scoring',
+    scope: SettingScope.Installation,
+    defaultValue: true,
+  },
+  {
+    type: 'string',
+    name: 'score_scam',
+    label: 'Scam accusations: score weight (integer, default 3)',
+    scope: SettingScope.Installation,
+    defaultValue: '3',
+  },
+
+  // --- Harassment / insults ---
+
+  {
     type: 'string',
     name: 'harassment_phrases',
     label: 'Harassment / insult phrases (comma or newline separated)',
@@ -48,6 +69,23 @@ Devvit.addSettings([
       'are you stupid,you are stupid,youre stupid,you are dumb,youre dumb,you must be blind,touch grass',
   },
   {
+    type: 'boolean',
+    name: 'enable_harassment_flags',
+    label: 'Harassment: enable detection & scoring',
+    scope: SettingScope.Installation,
+    defaultValue: true,
+  },
+  {
+    type: 'string',
+    name: 'score_harassment',
+    label: 'Harassment: score weight (integer, default 4)',
+    scope: SettingScope.Installation,
+    defaultValue: '4',
+  },
+
+  // --- Value policing ---
+
+  {
     type: 'string',
     name: 'value_policing_phrases',
     label: 'Aggressive value policing phrases (comma or newline separated)',
@@ -55,6 +93,23 @@ Devvit.addSettings([
     defaultValue:
       'ripoff,rip-off,trash offer,clown trade,terrible value,insane offer,this is ridiculous,greedy',
   },
+  {
+    type: 'boolean',
+    name: 'enable_policing_flags',
+    label: 'Value policing: enable detection & scoring',
+    scope: SettingScope.Installation,
+    defaultValue: true,
+  },
+  {
+    type: 'string',
+    name: 'score_policing',
+    label: 'Value policing: score weight (integer, default 1)',
+    scope: SettingScope.Installation,
+    defaultValue: '1',
+  },
+
+  // --- Global behaviour & filters ---
+
   {
     type: 'boolean',
     name: 'notify_via_modmail',
@@ -138,6 +193,20 @@ async function getResetWindowMs(
   const ms = days * 24 * 60 * 60 * 1000;
   console.log('getResetWindowMs: parsed days =', days, 'ms =', ms);
   return ms;
+}
+
+async function getScoreWeight(
+  context: Devvit.Context,
+  key: string,
+  fallback: number
+): Promise<number> {
+  const raw = (await context.settings.get(key)) as string | undefined;
+  if (!raw) return fallback;
+  const trimmed = raw.trim();
+  if (!trimmed) return fallback;
+  const value = parseInt(trimmed, 10);
+  if (isNaN(value)) return fallback;
+  return value;
 }
 
 /**
@@ -250,9 +319,23 @@ async function classifyComment(
 
   const flags: FlagType[] = [];
 
-  const scamHit = scamWords.some((w) => text.includes(w));
-  const harassHit = harassmentWords.some((w) => text.includes(w));
-  const policingHit = policingWords.some((w) => text.includes(w));
+  const scamEnabled =
+    ((await context.settings.get('enable_scam_flags')) as boolean | undefined) !==
+    false;
+  const harassmentEnabled =
+    ((await context.settings.get(
+      'enable_harassment_flags'
+    )) as boolean | undefined) !== false;
+  const policingEnabled =
+    ((await context.settings.get(
+      'enable_policing_flags'
+    )) as boolean | undefined) !== false;
+
+  const scamHit = scamEnabled && scamWords.some((w) => text.includes(w));
+  const harassHit =
+    harassmentEnabled && harassmentWords.some((w) => text.includes(w));
+  const policingHit =
+    policingEnabled && policingWords.some((w) => text.includes(w));
 
   console.log('classifyComment: scamWords =', scamWords, 'hit =', scamHit);
   console.log(
@@ -675,11 +758,17 @@ async function commandUserReport(
     lines.push('Recent flagged comments (most recent last):', '');
     const lastEvents = events.slice(-10);
     lastEvents.forEach((ev) => {
-      lines.push(
-        `- [${ev.createdAt}] delta: ${ev.delta}, flags: ${ev.flags.join(
-          ', '
-        )} — [view comment](${ev.permalink})`
-      );
+      const base = `- [${ev.createdAt}] delta: ${ev.delta}, flags: ${ev.flags.join(
+        ', '
+      )} — [view comment](${ev.permalink})`;
+      lines.push(base);
+
+      if (ev.postTitle) {
+        lines.push(`  • Post: *${ev.postTitle}*`);
+      }
+      if (ev.commentSnippet) {
+        lines.push(`  • Snippet: "${ev.commentSnippet}"`);
+      }
     });
   } else {
     lines.push(
@@ -844,7 +933,6 @@ async function handleModCommand(
         comment.id
       );
 
-      // event.comment is a raw model, so we need the API wrapper first
       const apiComment = await reddit.getCommentById(comment.id);
 
       if (typeof (apiComment as any).remove === 'function') {
@@ -969,18 +1057,30 @@ Devvit.addTrigger({
         const oldConduct = await getUserConduct(context, username);
         const conduct: UserConduct = { ...oldConduct };
 
+        const scamWeight = await getScoreWeight(context, 'score_scam', 3);
+        const harassmentWeight = await getScoreWeight(
+          context,
+          'score_harassment',
+          4
+        );
+        const policingWeight = await getScoreWeight(
+          context,
+          'score_policing',
+          1
+        );
+
         let delta = 0;
         if (flags.includes('SCAM_ACCUSATION')) {
           conduct.scamFlags += 1;
-          delta += 3;
+          delta += scamWeight;
         }
         if (flags.includes('HARASSMENT')) {
           conduct.harassmentFlags += 1;
-          delta += 4;
+          delta += harassmentWeight;
         }
         if (flags.includes('VALUE_POLICING')) {
           conduct.valueFlags += 1;
-          delta += 1;
+          delta += policingWeight;
         }
 
         conduct.score += delta;
@@ -1000,12 +1100,20 @@ Devvit.addTrigger({
         await addUserToIndex(context, username);
 
         const permalink = `https://reddit.com${comment.permalink}`;
+        const commentSnippet =
+          comment.body.length > 200
+            ? comment.body.slice(0, 200) + '…'
+            : comment.body;
+        const postTitle = post?.title ?? '';
+
         const ev: ConductEvent = {
           commentId: comment.id,
           permalink,
           flags,
           delta,
           createdAt: nowIso,
+          commentSnippet,
+          postTitle,
         };
         await addConductEvent(context, username, ev);
       } catch (err) {
