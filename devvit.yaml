@@ -1,0 +1,8 @@
+name: commentguardian
+
+app:
+  permissions:
+    - reddit:read
+    - reddit:comments
+    - reddit:modmail
+    - reddit:report
