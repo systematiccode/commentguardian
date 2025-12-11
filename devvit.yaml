@@ -3,6 +3,8 @@ name: commentguardian
 app:
   permissions:
     - reddit:read
+    - reddit:posts
     - reddit:comments
     - reddit:modmail
-    - reddit:report
+    - kv:read
+    - kv:write
