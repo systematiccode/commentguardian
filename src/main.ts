@@ -85,6 +85,13 @@ Devvit.addSettings([
     scope: SettingScope.Installation,
     defaultValue: '',
   },
+  {
+    type: 'boolean',
+    name: 'delete_command_comments',
+    label: 'Auto-remove !cg-* command comments from mods',
+    scope: SettingScope.Installation,
+    defaultValue: true,
+  },
 ]);
 
 Devvit.configure({
@@ -350,7 +357,6 @@ async function getUserConduct(
         'getUserConduct: conduct is older than reset window, resetting user',
         username
       );
-      // Reset their score & counts
       const reset: UserConduct = {
         score: 0,
         scamFlags: 0,
@@ -359,7 +365,6 @@ async function getUserConduct(
         lastUpdated: new Date().toISOString(),
       };
       await kv.put(key, reset);
-      // Also clear their event history
       await clearUserHistory(context, username);
       return reset;
     }
@@ -424,7 +429,6 @@ async function addConductEvent(
     ((await kv.get<ConductEvent[]>(key)) as ConductEvent[] | undefined) ?? [];
   const updated = [...existing, event];
 
-  // Keep only last 20 events per user
   const MAX_EVENTS = 20;
   const trimmed =
     updated.length > MAX_EVENTS
@@ -453,7 +457,7 @@ async function getUserEvents(
   return events;
 }
 
-// ---------- Mod / approved-user check for commands ----------
+// ---------- Mod-only check for commands (mods only) ----------
 
 async function isCommandUserAllowed(
   event: CommentCreate,
@@ -481,24 +485,19 @@ async function isCommandUserAllowed(
     username
   );
 
-  // 🔥 REMOVE APPROVED USER CHECK — ONLY MODS SHOULD BE ALLOWED
-
   let isMod = false;
   try {
     const mods = await context.reddit
       .getModerators({ subredditName, username })
       .all();
-
     isMod = mods.length > 0;
     console.log('isCommandUserAllowed: isMod =', isMod);
   } catch (error) {
     console.error('isCommandUserAllowed: error checking moderators:', error);
   }
 
-  // ONLY mods allowed
   return isMod;
 }
-
 
 // ---------- Mod commands (top offenders, threshold, user report, reset) ----------
 
@@ -714,10 +713,8 @@ async function commandResetUser(
     return;
   }
 
-  // Clear conduct + events
   await clearUserHistory(context, uname);
 
-  // Keep them in index, but their score will be 0 now
   const key = conductKeyForUser(uname);
   const empty: UserConduct = {
     score: 0,
@@ -735,7 +732,7 @@ async function commandResetUser(
   });
 }
 
-// ---------- Command handler ----------
+// ---------- Command handler (mods only, + optional auto-remove comment) ----------
 //
 // Commands:
 //  !cg-top                → top 20 offenders (all-time)
@@ -772,14 +769,14 @@ async function handleModCommand(
     args
   );
 
-  const { reddit } = context;
+  const { reddit, settings } = context;
 
-  // 🔐 Real mod / approved-user gate using Reddit API
+  // 🔐 Real mod-only gate using Reddit API
   const allowed = await isCommandUserAllowed(event, context);
   if (!allowed) {
     const eventAuthor: any = (event as any).author;
     console.log(
-      'handleModCommand: non-mod/non-approved tried to use command, ignoring',
+      'handleModCommand: non-mod tried to use command, ignoring',
       eventAuthor?.name
     );
     return;
@@ -832,6 +829,45 @@ async function handleModCommand(
     }
   } catch (err) {
     console.error('handleModCommand: error handling mod command', err);
+  }
+
+  // 🔻 Optionally auto-remove the command comment (for mods only)
+  try {
+    const deleteCommandsSetting = (await settings.get(
+      'delete_command_comments'
+    )) as boolean | undefined;
+    const shouldDelete = deleteCommandsSetting !== false; // default true
+
+    if (shouldDelete) {
+      console.log(
+        'handleModCommand: attempting to auto-remove command comment via API wrapper',
+        comment.id
+      );
+
+      // event.comment is a raw model, so we need the API wrapper first
+      const apiComment = await reddit.getCommentById(comment.id);
+
+      if (typeof (apiComment as any).remove === 'function') {
+        await (apiComment as any).remove();
+        console.log(
+          'handleModCommand: successfully removed command comment',
+          comment.id
+        );
+      } else {
+        console.log(
+          'handleModCommand: apiComment.remove is not a function, cannot delete command comment'
+        );
+      }
+    } else {
+      console.log(
+        'handleModCommand: delete_command_comments = false, leaving command comment'
+      );
+    }
+  } catch (err) {
+    console.error(
+      'handleModCommand: error while trying to remove command comment',
+      err
+    );
   }
 }
 
@@ -905,11 +941,7 @@ Devvit.addTrigger({
       console.log('CommentCreate: no flair filter, monitoring all posts');
     }
 
-    // 2) Skip mods/admins from scoring? (currently we don't, because event.author has no isMod/isAdmin)
-    // If you ever want to skip mods, you can re-add a reliable check here using isCommandUserAllowed
-    // and invert it.
-
-    // 3) Classify
+    // 2) Classify
     const flags = await classifyComment(comment.body, context);
     console.log('CommentCreate: classification flags =', flags);
 
@@ -921,7 +953,7 @@ Devvit.addTrigger({
 
     const flagList = flags.join(', ');
 
-    // 4) Resolve username
+    // 3) Resolve username
     const username = await resolveUsername(event, comment);
     console.log('CommentCreate: Username resolution result =', username);
 
@@ -967,7 +999,6 @@ Devvit.addTrigger({
         await saveUserConduct(context, username, conduct);
         await addUserToIndex(context, username);
 
-        // Store event with link to comment
         const permalink = `https://reddit.com${comment.permalink}`;
         const ev: ConductEvent = {
           commentId: comment.id,
@@ -989,7 +1020,6 @@ Devvit.addTrigger({
         ? comment.body.slice(0, 400) + '…'
         : comment.body;
 
-    // 5) Settings for actions
     const modmailSetting = (await settings.get(
       'notify_via_modmail'
     )) as boolean | undefined;
@@ -1008,7 +1038,6 @@ Devvit.addTrigger({
       sendModmail
     );
 
-    // 6) Report to modqueue
     if (reportToModqueue) {
       try {
         await reddit.report(comment, {
@@ -1020,7 +1049,6 @@ Devvit.addTrigger({
       }
     }
 
-    // 7) Optional per-comment modmail
     if (sendModmail) {
       const permalink = `https://reddit.com${comment.permalink}`;
 
