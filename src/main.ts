@@ -10,7 +10,23 @@ interface UserConduct {
   lastUpdated: string; // ISO
 }
 
+interface ConductEvent {
+  commentId: string;
+  permalink: string;
+  flags: FlagType[];
+  delta: number;
+  createdAt: string; // ISO
+}
+
 const CONDUCT_USERS_KEY = 'conduct_users';
+
+function conductKeyForUser(username: string): string {
+  return `conduct:${username.toLowerCase()}`;
+}
+
+function conductEventsKeyForUser(username: string): string {
+  return `conduct_events:${username.toLowerCase()}`;
+}
 
 // ---------- Settings ----------
 
@@ -61,6 +77,14 @@ Devvit.addSettings([
     scope: SettingScope.Installation,
     defaultValue: '',
   },
+  {
+    type: 'string',
+    name: 'score_reset_days',
+    label:
+      'Days after which a user score is reset (e.g. 90). Leave blank or 0 to never auto-reset.',
+    scope: SettingScope.Installation,
+    defaultValue: '',
+  },
 ]);
 
 Devvit.configure({
@@ -87,6 +111,26 @@ async function loadPhraseList(
 
   console.log('loadPhraseList:', key, 'parsed =', list);
   return list;
+}
+
+async function getResetWindowMs(
+  context: Devvit.Context
+): Promise<number | null> {
+  const raw = (await context.settings.get(
+    'score_reset_days'
+  )) as string | undefined;
+  console.log('getResetWindowMs: raw score_reset_days =', raw);
+
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const days = parseInt(trimmed, 10);
+  if (isNaN(days) || days <= 0) return null;
+
+  const ms = days * 24 * 60 * 60 * 1000;
+  console.log('getResetWindowMs: parsed days =', days, 'ms =', ms);
+  return ms;
 }
 
 /**
@@ -118,7 +162,7 @@ async function resolveUsername(
     return eventAuthor.name;
   }
 
-  // 2) API-backed method (may not exist in all envs)
+  // 2) API-backed method
   try {
     if ((comment as any).getAuthorName) {
       const apiName = await (comment as any).getAuthorName();
@@ -134,13 +178,13 @@ async function resolveUsername(
     console.log('resolveUsername: getAuthorName() threw error:', err);
   }
 
-  // 3) comment.author.name
+  // 3) comment.author.name (if ever present)
   if (comment.author?.name) {
     console.log('resolveUsername: using comment.author.name =', comment.author.name);
     return comment.author.name;
   }
 
-  // 4) comment.authorName field
+  // 4) comment.authorName
   if ((comment as any).authorName) {
     console.log(
       'resolveUsername: using comment.authorName =',
@@ -225,10 +269,32 @@ async function classifyComment(
   return flags;
 }
 
-// ---------- KV helpers (Stage 2 – scoring) ----------
+// ---------- KV helpers: scoring + events ----------
 
-function conductKeyForUser(username: string): string {
-  return `conduct:${username.toLowerCase()}`;
+async function clearUserHistory(
+  context: Devvit.Context,
+  username: string
+): Promise<void> {
+  const kv = context.kvStore;
+  if (!kv) return;
+  const conductKey = conductKeyForUser(username);
+  const eventsKey = conductEventsKeyForUser(username);
+  console.log(
+    'clearUserHistory: deleting keys',
+    conductKey,
+    'and',
+    eventsKey
+  );
+  try {
+    await kv.delete(conductKey);
+  } catch (err) {
+    console.log('clearUserHistory: error deleting conduct key', err);
+  }
+  try {
+    await kv.delete(eventsKey);
+  } catch (err) {
+    console.log('clearUserHistory: error deleting events key', err);
+  }
 }
 
 async function getUserConduct(
@@ -253,19 +319,53 @@ async function getUserConduct(
 
   console.log('getUserConduct: key =', key, 'stored =', stored);
 
-  if (stored) {
-    return stored;
+  const now = Date.now();
+  const resetWindowMs = await getResetWindowMs(context);
+
+  if (!stored) {
+    const empty: UserConduct = {
+      score: 0,
+      scamFlags: 0,
+      harassmentFlags: 0,
+      valueFlags: 0,
+      lastUpdated: new Date().toISOString(),
+    };
+    console.log('getUserConduct: no existing conduct, returning empty object');
+    return empty;
   }
 
-  const empty: UserConduct = {
-    score: 0,
-    scamFlags: 0,
-    harassmentFlags: 0,
-    valueFlags: 0,
-    lastUpdated: new Date().toISOString(),
-  };
-  console.log('getUserConduct: no existing conduct, returning empty object');
-  return empty;
+  if (resetWindowMs != null && stored.lastUpdated) {
+    const last = new Date(stored.lastUpdated).getTime();
+    const age = now - last;
+    console.log(
+      'getUserConduct: checking reset window for',
+      username,
+      'age ms =',
+      age,
+      'window ms =',
+      resetWindowMs
+    );
+    if (age > resetWindowMs) {
+      console.log(
+        'getUserConduct: conduct is older than reset window, resetting user',
+        username
+      );
+      // Reset their score & counts
+      const reset: UserConduct = {
+        score: 0,
+        scamFlags: 0,
+        harassmentFlags: 0,
+        valueFlags: 0,
+        lastUpdated: new Date().toISOString(),
+      };
+      await kv.put(key, reset);
+      // Also clear their event history
+      await clearUserHistory(context, username);
+      return reset;
+    }
+  }
+
+  return stored;
 }
 
 async function saveUserConduct(
@@ -309,7 +409,98 @@ async function addUserToIndex(
   }
 }
 
-// ---------- Mod commands (top offenders, user report) ----------
+async function addConductEvent(
+  context: Devvit.Context,
+  username: string,
+  event: ConductEvent
+): Promise<void> {
+  const kv = context.kvStore;
+  if (!kv) {
+    console.log('addConductEvent: kvStore missing, skipping event log');
+    return;
+  }
+  const key = conductEventsKeyForUser(username);
+  const existing =
+    ((await kv.get<ConductEvent[]>(key)) as ConductEvent[] | undefined) ?? [];
+  const updated = [...existing, event];
+
+  // Keep only last 20 events per user
+  const MAX_EVENTS = 20;
+  const trimmed =
+    updated.length > MAX_EVENTS
+      ? updated.slice(updated.length - MAX_EVENTS)
+      : updated;
+
+  console.log(
+    'addConductEvent: saving events for',
+    username,
+    'count =',
+    trimmed.length
+  );
+  await kv.put(key, trimmed);
+}
+
+async function getUserEvents(
+  context: Devvit.Context,
+  username: string
+): Promise<ConductEvent[]> {
+  const kv = context.kvStore;
+  if (!kv) return [];
+  const key = conductEventsKeyForUser(username);
+  const events =
+    ((await kv.get<ConductEvent[]>(key)) as ConductEvent[] | undefined) ?? [];
+  console.log('getUserEvents: for', username, 'count =', events.length);
+  return events;
+}
+
+// ---------- Mod / approved-user check for commands ----------
+
+async function isCommandUserAllowed(
+  event: CommentCreate,
+  context: Devvit.Context
+): Promise<boolean> {
+  const subredditName = event.subreddit?.name;
+  const username = (event as any).author?.name as string | undefined;
+
+  if (!subredditName || !username) {
+    console.log(
+      'isCommandUserAllowed: missing subredditName or username',
+      'subredditName =',
+      subredditName,
+      'username =',
+      username
+    );
+    return false;
+  }
+
+  console.log(
+    'isCommandUserAllowed: checking',
+    'subredditName =',
+    subredditName,
+    'username =',
+    username
+  );
+
+  // 🔥 REMOVE APPROVED USER CHECK — ONLY MODS SHOULD BE ALLOWED
+
+  let isMod = false;
+  try {
+    const mods = await context.reddit
+      .getModerators({ subredditName, username })
+      .all();
+
+    isMod = mods.length > 0;
+    console.log('isCommandUserAllowed: isMod =', isMod);
+  } catch (error) {
+    console.error('isCommandUserAllowed: error checking moderators:', error);
+  }
+
+  // ONLY mods allowed
+  return isMod;
+}
+
+
+// ---------- Mod commands (top offenders, threshold, user report, reset) ----------
 
 async function commandTopOffenders(
   context: Devvit.Context,
@@ -318,7 +509,6 @@ async function commandTopOffenders(
   const { reddit, kvStore } = context;
   console.log('commandTopOffenders: kvStore exists =', !!kvStore);
   if (!kvStore) {
-    console.log('commandTopOffenders: kvStore missing, sending KV error modmail');
     await reddit.modMail.createModInboxConversation({
       subredditId,
       subject: '[CommentGuardian] KV not available',
@@ -328,15 +518,12 @@ async function commandTopOffenders(
     return;
   }
 
-  console.log('commandTopOffenders: fetching index from kvStore');
   let users =
     ((await kvStore.get<string[]>(CONDUCT_USERS_KEY)) as string[] | undefined) ??
     [];
-
   console.log('commandTopOffenders: raw users =', users);
 
   users = users.filter((u) => u && u !== '[unknown]');
-
   console.log('commandTopOffenders: filtered users =', users);
 
   if (users.length === 0) {
@@ -346,24 +533,17 @@ async function commandTopOffenders(
       bodyMarkdown:
         'CommentGuardian does not have any tracked users yet (no flagged comments with valid authors).',
     });
-    console.log('commandTopOffenders: sent "no tracked users" modmail');
     return;
   }
 
   const records: { username: string; conduct: UserConduct }[] = [];
 
   for (const uname of users) {
-    console.log('commandTopOffenders: loading conduct for', uname);
     const conduct = await getUserConduct(context, uname);
-    console.log('commandTopOffenders: conduct for', uname, '=', conduct);
     if (conduct.score > 0) {
       records.push({ username: uname, conduct });
-    } else {
-      console.log('commandTopOffenders:', uname, 'has non-positive score, skipping');
     }
   }
-
-  console.log('commandTopOffenders: records with positive score =', records);
 
   if (records.length === 0) {
     await reddit.modMail.createModInboxConversation({
@@ -372,14 +552,11 @@ async function commandTopOffenders(
       bodyMarkdown:
         'No users currently have a positive CommentGuardian score.',
     });
-    console.log('commandTopOffenders: sent "no positive scores" modmail');
     return;
   }
 
   records.sort((a, b) => b.conduct.score - a.conduct.score);
   const top = records.slice(0, 20);
-
-  console.log('commandTopOffenders: top offenders =', top);
 
   const lines: string[] = [];
   lines.push('Top CommentGuardian offenders (all-time):', '');
@@ -396,53 +573,175 @@ async function commandTopOffenders(
     subject: '[CommentGuardian] Top offenders (all-time)',
     bodyMarkdown: lines.join('\n'),
   });
-  console.log('commandTopOffenders: modmail sent with top offenders');
+}
+
+async function commandOverThreshold(
+  context: Devvit.Context,
+  subredditId: string,
+  threshold: number
+): Promise<void> {
+  const { reddit, kvStore } = context;
+  console.log('commandOverThreshold: threshold =', threshold);
+  if (!kvStore) {
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: '[CommentGuardian] KV not available',
+      bodyMarkdown:
+        'KV is not available for this app. Please check Devvit.configure and permissions.',
+    });
+    return;
+  }
+
+  let users =
+    ((await kvStore.get<string[]>(CONDUCT_USERS_KEY)) as string[] | undefined) ??
+    [];
+  users = users.filter((u) => u && u !== '[unknown]');
+  console.log('commandOverThreshold: users =', users);
+
+  if (users.length === 0) {
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: `[CommentGuardian] Users with score ≥ ${threshold}`,
+      bodyMarkdown: 'No tracked users.',
+    });
+    return;
+  }
+
+  const matched: { username: string; conduct: UserConduct }[] = [];
+
+  for (const uname of users) {
+    const conduct = await getUserConduct(context, uname);
+    if (conduct.score >= threshold) {
+      matched.push({ username: uname, conduct });
+    }
+  }
+
+  if (matched.length === 0) {
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: `[CommentGuardian] Users with score ≥ ${threshold}`,
+      bodyMarkdown: `No users currently have a score ≥ ${threshold}.`,
+    });
+    return;
+  }
+
+  matched.sort((a, b) => b.conduct.score - a.conduct.score);
+
+  const lines: string[] = [];
+  lines.push(
+    `Users with CommentGuardian score ≥ ${threshold}:`,
+    ''
+  );
+
+  matched.forEach((r, idx) => {
+    const c = r.conduct;
+    lines.push(
+      `${idx + 1}. u/${r.username} — score: ${c.score}, scam: ${c.scamFlags}, harassment: ${c.harassmentFlags}, policing: ${c.valueFlags}`
+    );
+  });
+
+  await reddit.modMail.createModInboxConversation({
+    subredditId,
+    subject: `[CommentGuardian] Users with score ≥ ${threshold}`,
+    bodyMarkdown: lines.join('\n'),
+  });
 }
 
 async function commandUserReport(
   context: Devvit.Context,
   subredditId: string,
-  args: string[]
+  username: string
 ): Promise<void> {
   const { reddit } = context;
 
-  console.log('commandUserReport: args =', args);
+  const uname = username.replace(/^u\//i, '');
+  console.log('commandUserReport: generating report for', uname);
 
-  if (args.length === 0) {
-    await reddit.modMail.createModInboxConversation({
-      subredditId,
-      subject: '[CommentGuardian] User report – missing username',
-      bodyMarkdown: 'Usage: `!cg-user username`',
-    });
-    console.log('commandUserReport: missing username, sent usage modmail');
-    return;
-  }
-
-  const username = args[0].replace(/^u\//i, '');
-  console.log('commandUserReport: generating report for', username);
-
-  const conduct = await getUserConduct(context, username);
+  const conduct = await getUserConduct(context, uname);
+  const events = await getUserEvents(context, uname);
 
   const lines: string[] = [];
   lines.push(
-    `**CommentGuardian user report: u/${username}**`,
+    `**CommentGuardian user report: u/${uname}**`,
     '',
     `• Score: ${conduct.score}`,
     `• Scam flags: ${conduct.scamFlags}`,
     `• Harassment flags: ${conduct.harassmentFlags}`,
     `• Policing flags: ${conduct.valueFlags}`,
-    `• Last updated: ${conduct.lastUpdated}`
+    `• Last updated: ${conduct.lastUpdated}`,
+    ''
   );
+
+  if (events.length > 0) {
+    lines.push('Recent flagged comments (most recent last):', '');
+    const lastEvents = events.slice(-10);
+    lastEvents.forEach((ev) => {
+      lines.push(
+        `- [${ev.createdAt}] delta: ${ev.delta}, flags: ${ev.flags.join(
+          ', '
+        )} — [view comment](${ev.permalink})`
+      );
+    });
+  } else {
+    lines.push(
+      '_No stored flagged comment history for this user (or it has been reset)._' 
+    );
+  }
 
   await reddit.modMail.createModInboxConversation({
     subredditId,
-    subject: `[CommentGuardian] User report for u/${username}`,
+    subject: `[CommentGuardian] User report for u/${uname}`,
     bodyMarkdown: lines.join('\n'),
   });
-  console.log('commandUserReport: modmail sent for user', username);
+}
+
+async function commandResetUser(
+  context: Devvit.Context,
+  subredditId: string,
+  username: string
+): Promise<void> {
+  const { reddit, kvStore } = context;
+  const uname = username.replace(/^u\//i, '');
+  console.log('commandResetUser: resetting user', uname);
+
+  if (!kvStore) {
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: '[CommentGuardian] KV not available',
+      bodyMarkdown:
+        'KV is not available for this app. Please check Devvit.configure and permissions.',
+    });
+    return;
+  }
+
+  // Clear conduct + events
+  await clearUserHistory(context, uname);
+
+  // Keep them in index, but their score will be 0 now
+  const key = conductKeyForUser(uname);
+  const empty: UserConduct = {
+    score: 0,
+    scamFlags: 0,
+    harassmentFlags: 0,
+    valueFlags: 0,
+    lastUpdated: new Date().toISOString(),
+  };
+  await kvStore.put(key, empty);
+
+  await reddit.modMail.createModInboxConversation({
+    subredditId,
+    subject: `[CommentGuardian] User reset: u/${uname}`,
+    bodyMarkdown: `User u/${uname} has been reset (score and history cleared).`,
+  });
 }
 
 // ---------- Command handler ----------
+//
+// Commands:
+//  !cg-top                → top 20 offenders (all-time)
+//  !cg-user username      → detailed report + links
+//  !cg-over N             → all users with score ≥ N
+//  !cg-reset username     → reset one user (score + history)
 
 async function handleModCommand(
   event: CommentCreate,
@@ -473,13 +772,61 @@ async function handleModCommand(
     args
   );
 
+  const { reddit } = context;
+
+  // 🔐 Real mod / approved-user gate using Reddit API
+  const allowed = await isCommandUserAllowed(event, context);
+  if (!allowed) {
+    const eventAuthor: any = (event as any).author;
+    console.log(
+      'handleModCommand: non-mod/non-approved tried to use command, ignoring',
+      eventAuthor?.name
+    );
+    return;
+  }
+
   try {
     if (cmd === '!cg-top') {
-      console.log('handleModCommand: dispatching to commandTopOffenders');
       await commandTopOffenders(context, subreddit.id);
     } else if (cmd === '!cg-user') {
-      console.log('handleModCommand: dispatching to commandUserReport');
-      await commandUserReport(context, subreddit.id, args);
+      if (args.length === 0) {
+        await reddit.modMail.createModInboxConversation({
+          subredditId: subreddit.id,
+          subject: '[CommentGuardian] User report – missing username',
+          bodyMarkdown: 'Usage: `!cg-user username`',
+        });
+      } else {
+        await commandUserReport(context, subreddit.id, args[0]);
+      }
+    } else if (cmd === '!cg-over') {
+      if (args.length === 0) {
+        await reddit.modMail.createModInboxConversation({
+          subredditId: subreddit.id,
+          subject: '[CommentGuardian] Threshold report – missing number',
+          bodyMarkdown: 'Usage: `!cg-over 5`',
+        });
+      } else {
+        const threshold = parseInt(args[0], 10);
+        if (isNaN(threshold)) {
+          await reddit.modMail.createModInboxConversation({
+            subredditId: subreddit.id,
+            subject: '[CommentGuardian] Threshold report – invalid number',
+            bodyMarkdown: 'Usage: `!cg-over 5` (score must be a number).',
+          });
+        } else {
+          await commandOverThreshold(context, subreddit.id, threshold);
+        }
+      }
+    } else if (cmd === '!cg-reset') {
+      if (args.length === 0) {
+        await reddit.modMail.createModInboxConversation({
+          subredditId: subreddit.id,
+          subject: '[CommentGuardian] Reset user – missing username',
+          bodyMarkdown: 'Usage: `!cg-reset username`',
+        });
+      } else {
+        await commandResetUser(context, subreddit.id, args[0]);
+      }
     } else {
       console.log('handleModCommand: unknown command, doing nothing');
     }
@@ -558,19 +905,9 @@ Devvit.addTrigger({
       console.log('CommentCreate: no flair filter, monitoring all posts');
     }
 
-    // 2) Skip mods/admins using event.author
-    const eventAuthor: any = (event as any).author;
-    if (eventAuthor?.isAdmin || eventAuthor?.isMod) {
-      console.log(
-        'CommentCreate: skipping comment from mod/admin',
-        'isAdmin =',
-        eventAuthor?.isAdmin,
-        'isMod =',
-        eventAuthor?.isMod
-      );
-      console.log('CommentCreate: END (mod/admin)');
-      return;
-    }
+    // 2) Skip mods/admins from scoring? (currently we don't, because event.author has no isMod/isAdmin)
+    // If you ever want to skip mods, you can re-add a reliable check here using isCommandUserAllowed
+    // and invert it.
 
     // 3) Classify
     const flags = await classifyComment(comment.body, context);
@@ -587,6 +924,8 @@ Devvit.addTrigger({
     // 4) Resolve username
     const username = await resolveUsername(event, comment);
     console.log('CommentCreate: Username resolution result =', username);
+
+    const nowIso = new Date().toISOString();
 
     if (!username) {
       console.log(
@@ -627,6 +966,17 @@ Devvit.addTrigger({
 
         await saveUserConduct(context, username, conduct);
         await addUserToIndex(context, username);
+
+        // Store event with link to comment
+        const permalink = `https://reddit.com${comment.permalink}`;
+        const ev: ConductEvent = {
+          commentId: comment.id,
+          permalink,
+          flags,
+          delta,
+          createdAt: nowIso,
+        };
+        await addConductEvent(context, username, ev);
       } catch (err) {
         console.error('CommentCreate: error during scoring / KV operations', err);
       }
