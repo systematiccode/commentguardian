@@ -61,14 +61,6 @@ Devvit.addSettings([
     scope: SettingScope.Installation,
     defaultValue: '',
   },
-  {
-    type: 'string',
-    name: 'dev_override_username',
-    label:
-      'DEV ONLY: Override username (for dev subs). Leave blank in production.',
-    scope: SettingScope.Installation,
-    defaultValue: '',
-  },
 ]);
 
 Devvit.configure({
@@ -99,16 +91,15 @@ async function loadPhraseList(
 
 /**
  * Resolve a username using:
- *  0) dev_override_username (for dev subs / testing)
  *  1) event.author?.name
  *  2) comment.getAuthorName()
- *  3) comment.authorName
+ *  3) comment.author?.name
+ *  4) comment.authorName
  */
 async function resolveUsername(
-  context: Devvit.Context,
-  event: CommentCreate
+  event: CommentCreate,
+  comment: any
 ): Promise<string | undefined> {
-  const comment = event.comment;
   const eventAuthor: any = (event as any).author;
 
   console.log(
@@ -121,23 +112,13 @@ async function resolveUsername(
     (comment as any).authorName
   );
 
-  // 0) DEV override
-  const devOverride = (await context.settings.get(
-    'dev_override_username'
-  )) as string | undefined;
-  if (devOverride && devOverride.trim().length > 0) {
-    const trimmed = devOverride.trim();
-    console.log('resolveUsername: using dev_override_username =', trimmed);
-    return trimmed;
-  }
-
-  // 1) event.author.name (what your log shows)
+  // 1) event.author.name
   if (eventAuthor?.name) {
     console.log('resolveUsername: using event.author.name =', eventAuthor.name);
     return eventAuthor.name;
   }
 
-  // 2) API-backed method (may not exist in this environment)
+  // 2) API-backed method (may not exist in all envs)
   try {
     if ((comment as any).getAuthorName) {
       const apiName = await (comment as any).getAuthorName();
@@ -153,7 +134,13 @@ async function resolveUsername(
     console.log('resolveUsername: getAuthorName() threw error:', err);
   }
 
-  // 3) comment.authorName field (if Devvit ever fills it)
+  // 3) comment.author.name
+  if (comment.author?.name) {
+    console.log('resolveUsername: using comment.author.name =', comment.author.name);
+    return comment.author.name;
+  }
+
+  // 4) comment.authorName field
   if ((comment as any).authorName) {
     console.log(
       'resolveUsername: using comment.authorName =',
@@ -162,7 +149,7 @@ async function resolveUsername(
     return (comment as any).authorName;
   }
 
-  console.log('resolveUsername: username missing (fallback failed)');
+  console.log('resolveUsername: username missing (fallbacks failed)');
   return undefined;
 }
 
@@ -529,7 +516,7 @@ Devvit.addTrigger({
       rawBody
     );
 
-    // Commands
+    // 0) Commands
     if (bodyLower.startsWith('!cg-')) {
       console.log('CommentCreate: detected command, routing to handleModCommand');
       await handleModCommand(event, context);
@@ -537,7 +524,7 @@ Devvit.addTrigger({
       return;
     }
 
-    // Flair filter (optional)
+    // 1) Flair filter (optional)
     const monitoredFlairsRaw = (await settings.get(
       'monitored_post_flairs'
     )) as string | undefined;
@@ -571,7 +558,7 @@ Devvit.addTrigger({
       console.log('CommentCreate: no flair filter, monitoring all posts');
     }
 
-    // Skip mods/admins (optional)
+    // 2) Skip mods/admins using event.author
     const eventAuthor: any = (event as any).author;
     if (eventAuthor?.isAdmin || eventAuthor?.isMod) {
       console.log(
@@ -585,7 +572,7 @@ Devvit.addTrigger({
       return;
     }
 
-    // Classify
+    // 3) Classify
     const flags = await classifyComment(comment.body, context);
     console.log('CommentCreate: classification flags =', flags);
 
@@ -597,8 +584,8 @@ Devvit.addTrigger({
 
     const flagList = flags.join(', ');
 
-    // Resolve username
-    const username = await resolveUsername(context, event);
+    // 4) Resolve username
+    const username = await resolveUsername(event, comment);
     console.log('CommentCreate: Username resolution result =', username);
 
     if (!username) {
@@ -652,7 +639,7 @@ Devvit.addTrigger({
         ? comment.body.slice(0, 400) + '…'
         : comment.body;
 
-    // Settings
+    // 5) Settings for actions
     const modmailSetting = (await settings.get(
       'notify_via_modmail'
     )) as boolean | undefined;
@@ -671,7 +658,7 @@ Devvit.addTrigger({
       sendModmail
     );
 
-    // Report to modqueue
+    // 6) Report to modqueue
     if (reportToModqueue) {
       try {
         await reddit.report(comment, {
@@ -683,7 +670,7 @@ Devvit.addTrigger({
       }
     }
 
-    // Optional per-comment modmail
+    // 7) Optional per-comment modmail
     if (sendModmail) {
       const permalink = `https://reddit.com${comment.permalink}`;
 
