@@ -8,6 +8,7 @@ interface UserConduct {
   harassmentFlags: number;
   valueFlags: number;
   lastUpdated: string; // ISO
+  lastAlertScore?: number; // highest threshold we’ve already alerted on
 }
 
 interface ConductEvent {
@@ -143,6 +144,23 @@ Devvit.addSettings([
     scope: SettingScope.Installation,
     defaultValue: true,
   },
+
+  // --- Threshold alert config (Stage 2 #1) ---
+  {
+    type: 'boolean',
+    name: 'alert_threshold_enabled',
+    label: 'Enable score threshold alerts (modmail when a user crosses a score)',
+    scope: SettingScope.Installation,
+    defaultValue: false,
+  },
+  {
+    type: 'string',
+    name: 'alert_threshold_score',
+    label:
+      'Alert threshold score (e.g., 20). Leave blank or 0 to disable alerts.',
+    scope: SettingScope.Installation,
+    defaultValue: '',
+  },
 ]);
 
 Devvit.configure({
@@ -205,6 +223,34 @@ async function getScoreWeight(
   return value;
 }
 
+async function getAlertThreshold(
+  context: Devvit.Context
+): Promise<number | null> {
+  const enabled = (await context.settings.get(
+    'alert_threshold_enabled'
+  )) as boolean | undefined;
+  const raw = (await context.settings.get(
+    'alert_threshold_score'
+  )) as string | undefined;
+
+  console.log(
+    'getAlertThreshold: enabled =',
+    enabled,
+    'raw alert_threshold_score =',
+    raw
+  );
+
+  if (enabled === false) return null;
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const n = parseInt(trimmed, 10);
+  if (isNaN(n) || n <= 0) return null;
+
+  return n;
+}
+
 /**
  * Resolve a username using:
  *  1) event.author?.name
@@ -250,7 +296,7 @@ async function resolveUsername(
     console.log('resolveUsername: getAuthorName() threw error:', err);
   }
 
-  // 3) comment.author.name (if ever present)
+  // 3) comment.author.name
   if (comment.author?.name) {
     console.log('resolveUsername: using comment.author.name =', comment.author.name);
     return comment.author.name;
@@ -536,7 +582,7 @@ async function getUserEvents(
   return events;
 }
 
-// ---------- Auto-clean helper (Stage 2 #1) ----------
+// ---------- Auto-clean helper (Stage 2 #1 baseline) ----------
 
 async function autoCleanStaleUsers(
   context: Devvit.Context,
@@ -627,6 +673,7 @@ async function autoCleanStaleUsers(
         harassmentFlags: 0,
         valueFlags: 0,
         lastUpdated: new Date().toISOString(),
+        lastAlertScore: 0,
       };
       await kvStore.put(key, reset);
       cleaned.push(uname);
@@ -658,7 +705,7 @@ async function autoCleanStaleUsers(
   console.log('autoCleanStaleUsers: completed, cleaned =', cleaned.length);
 }
 
-// ---------- Mod-only check for commands (mods only) ----------
+// ---------- Mod-only check for commands ----------
 
 async function isCommandUserAllowed(
   event: CommentCreate,
@@ -709,6 +756,7 @@ async function isCommandUserAllowed(
 //  !cg-reset username     → reset one user (score + history)
 //  !cg-clean              → run auto-clean now based on score_reset_days
 //  !cg-deduct username N  → subtract N points from a user (but not below 0)
+//  !cg-add username N     → add N points to a user (manual adjustment)
 
 async function commandTopOffenders(
   context: Devvit.Context,
@@ -886,7 +934,7 @@ async function commandUserReport(
     lastEvents.forEach((ev) => {
       const base = `- [${ev.createdAt}] delta: ${ev.delta}, flags: ${ev.flags.join(
         ', '
-      )} — [view comment](${ev.permalink})`;
+      )} — ${ev.permalink ? `[view comment](${ev.permalink})` : '(manual)'}`;
       lines.push(base);
 
       if (ev.postTitle) {
@@ -937,6 +985,7 @@ async function commandResetUser(
     harassmentFlags: 0,
     valueFlags: 0,
     lastUpdated: new Date().toISOString(),
+    lastAlertScore: 0,
   };
   await kvStore.put(key, empty);
 
@@ -947,7 +996,7 @@ async function commandResetUser(
   });
 }
 
-// NEW: generic score adjustment helper
+// Generic score adjustment helper (used by !cg-deduct and !cg-add)
 async function commandAdjustScore(
   context: Devvit.Context,
   subredditId: string,
@@ -968,19 +1017,15 @@ async function commandAdjustScore(
     return;
   }
 
-  // Get current conduct
   const conduct = await getUserConduct(context, uname);
   const oldScore = conduct.score;
 
-  // Apply delta, but never go below 0
   const newScore = Math.max(0, oldScore + delta);
   conduct.score = newScore;
   conduct.lastUpdated = new Date().toISOString();
 
-  // Save updated conduct
   await kvStore.put(conductKeyForUser(uname), conduct);
 
-  // Log a "manual adjustment" event so it shows up in !cg-user history
   const eventsKey = conductEventsKeyForUser(uname);
   const existingEvents =
     ((await kvStore.get<ConductEvent[]>(eventsKey)) as ConductEvent[] |
@@ -1007,7 +1052,6 @@ async function commandAdjustScore(
 
   await kvStore.put(eventsKey, trimmedEvents);
 
-  // Confirm via modmail
   const lines: string[] = [];
   lines.push(
     `Score for u/${uname} adjusted by ${delta > 0 ? '+' : ''}${delta} points.`,
@@ -1023,7 +1067,7 @@ async function commandAdjustScore(
   });
 }
 
-// ---------- Command handler (mods only, + optional auto-remove comment) ----------
+// ---------- Command handler (mods only, + optional auto-remove) ----------
 
 async function handleModCommand(
   event: CommentCreate,
@@ -1056,7 +1100,6 @@ async function handleModCommand(
 
   const { reddit, settings } = context;
 
-  // 🔐 Real mod-only gate using Reddit API
   const allowed = await isCommandUserAllowed(event, context);
   if (!allowed) {
     const eventAuthor: any = (event as any).author;
@@ -1113,7 +1156,6 @@ async function handleModCommand(
     } else if (cmd === '!cg-clean') {
       await autoCleanStaleUsers(context, subreddit.id);
     } else if (cmd === '!cg-deduct') {
-      // Usage: !cg-deduct u/username 5
       if (args.length < 2) {
         await reddit.modMail.createModInboxConversation({
           subredditId: subreddit.id,
@@ -1141,6 +1183,34 @@ async function handleModCommand(
           );
         }
       }
+    } else if (cmd === '!cg-add') {
+      if (args.length < 2) {
+        await reddit.modMail.createModInboxConversation({
+          subredditId: subreddit.id,
+          subject: '[CommentGuardian] Add score – missing arguments',
+          bodyMarkdown:
+            'Usage: `!cg-add username points` (e.g. `!cg-add u/example 3`).',
+        });
+      } else {
+        const targetUser = args[0];
+        const amount = parseInt(args[1], 10);
+
+        if (isNaN(amount) || amount <= 0) {
+          await reddit.modMail.createModInboxConversation({
+            subredditId: subreddit.id,
+            subject: '[CommentGuardian] Add score – invalid amount',
+            bodyMarkdown:
+              'Points must be a positive integer. Example: `!cg-add u/example 3`.',
+          });
+        } else {
+          await commandAdjustScore(
+            context,
+            subreddit.id,
+            targetUser,
+            amount
+          );
+        }
+      }
     } else {
       console.log('handleModCommand: unknown command, doing nothing');
     }
@@ -1148,12 +1218,12 @@ async function handleModCommand(
     console.error('handleModCommand: error handling mod command', err);
   }
 
-  // 🔻 Optionally auto-remove the command comment (for mods only)
+  // Optionally auto-remove command comment
   try {
     const deleteCommandsSetting = (await settings.get(
       'delete_command_comments'
     )) as boolean | undefined;
-    const shouldDelete = deleteCommandsSetting !== false; // default true
+    const shouldDelete = deleteCommandsSetting !== false;
 
     if (shouldDelete) {
       console.log(
@@ -1275,6 +1345,13 @@ Devvit.addTrigger({
 
     const nowIso = new Date().toISOString();
 
+    // Threshold config for possible alert
+    const threshold = await getAlertThreshold(context);
+    console.log('CommentCreate: threshold from settings =', threshold);
+
+    let thresholdAlertNeeded = false;
+    let usernameForAlert: string | undefined;
+
     if (!username) {
       console.log(
         'CommentCreate: no username available, skipping scoring but will still report'
@@ -1284,6 +1361,8 @@ Devvit.addTrigger({
         console.log('CommentCreate: entering scoring logic for', username);
         const oldConduct = await getUserConduct(context, username);
         const conduct: UserConduct = { ...oldConduct };
+
+        const oldScore = oldConduct.score ?? 0;
 
         const scamWeight = await getScoreWeight(context, 'score_scam', 3);
         const harassmentWeight = await getScoreWeight(
@@ -1311,7 +1390,7 @@ Devvit.addTrigger({
           delta += policingWeight;
         }
 
-        conduct.score += delta;
+        conduct.score = (conduct.score ?? 0) + delta;
 
         console.log(
           'CommentCreate: updating conduct for',
@@ -1323,6 +1402,37 @@ Devvit.addTrigger({
           'newConduct =',
           conduct
         );
+
+        // Threshold-crossing check
+        if (threshold != null) {
+          const lastAlertScore = conduct.lastAlertScore ?? 0;
+          console.log(
+            'CommentCreate: threshold check for',
+            username,
+            'oldScore =',
+            oldScore,
+            'newScore =',
+            conduct.score,
+            'lastAlertScore =',
+            lastAlertScore,
+            'threshold =',
+            threshold
+          );
+
+          if (
+            oldScore < threshold &&
+            conduct.score >= threshold &&
+            lastAlertScore < threshold
+          ) {
+            console.log(
+              'CommentCreate: user crossed threshold, will send alert for',
+              username
+            );
+            conduct.lastAlertScore = threshold;
+            thresholdAlertNeeded = true;
+            usernameForAlert = username;
+          }
+        }
 
         await saveUserConduct(context, username, conduct);
         await addUserToIndex(context, username);
@@ -1408,6 +1518,60 @@ Devvit.addTrigger({
         console.log('CommentCreate: per-comment modmail sent successfully');
       } catch (err) {
         console.error('CommentCreate: error creating per-comment modmail', err);
+      }
+    }
+
+    // Threshold-crossing alert (Stage 2 #1)
+    if (thresholdAlertNeeded && usernameForAlert) {
+      console.log(
+        'CommentCreate: sending threshold alert modmail for',
+        usernameForAlert,
+        'threshold =',
+        threshold
+      );
+      const conduct = await getUserConduct(context, usernameForAlert);
+      const events = await getUserEvents(context, usernameForAlert);
+
+      const lines: string[] = [];
+      lines.push(
+        `u/${usernameForAlert} has crossed the CommentGuardian threshold score of ${threshold}.`,
+        '',
+        `• Current score: ${conduct.score}`,
+        `• Scam flags: ${conduct.scamFlags}`,
+        `• Harassment flags: ${conduct.harassmentFlags}`,
+        `• Policing flags: ${conduct.valueFlags}`,
+        `• Last updated: ${conduct.lastUpdated}`,
+        ''
+      );
+
+      if (events.length > 0) {
+        lines.push('Recent flagged comments:', '');
+        const lastEvents = events.slice(-5);
+        lastEvents.forEach((ev) => {
+          const base = `- [${ev.createdAt}] delta: ${ev.delta}, flags: ${ev.flags.join(
+            ', '
+          )} — ${ev.permalink ? `[view](${ev.permalink})` : '(manual)'}`;
+          lines.push(base);
+          if (ev.postTitle) lines.push(`  • Post: *${ev.postTitle}*`);
+          if (ev.commentSnippet) lines.push(`  • Snippet: "${ev.commentSnippet}"`);
+        });
+      }
+
+      try {
+        await reddit.modMail.createModInboxConversation({
+          subredditId: subreddit.id,
+          subject: `[CommentGuardian] Threshold reached for u/${usernameForAlert}`,
+          bodyMarkdown: lines.join('\n'),
+        });
+        console.log(
+          'CommentCreate: threshold alert modmail sent for',
+          usernameForAlert
+        );
+      } catch (err) {
+        console.error(
+          'CommentCreate: error creating threshold alert modmail',
+          err
+        );
       }
     }
 
