@@ -34,7 +34,6 @@ function conductEventsKeyForUser(username: string): string {
 
 Devvit.addSettings([
   // --- Scam accusations ---
-
   {
     type: 'string',
     name: 'scam_phrases',
@@ -59,7 +58,6 @@ Devvit.addSettings([
   },
 
   // --- Harassment / insults ---
-
   {
     type: 'string',
     name: 'harassment_phrases',
@@ -84,7 +82,6 @@ Devvit.addSettings([
   },
 
   // --- Value policing ---
-
   {
     type: 'string',
     name: 'value_policing_phrases',
@@ -109,7 +106,6 @@ Devvit.addSettings([
   },
 
   // --- Global behaviour & filters ---
-
   {
     type: 'boolean',
     name: 'notify_via_modmail',
@@ -540,6 +536,128 @@ async function getUserEvents(
   return events;
 }
 
+// ---------- Auto-clean helper (Stage 2 #1) ----------
+
+async function autoCleanStaleUsers(
+  context: Devvit.Context,
+  subredditId: string
+): Promise<void> {
+  const { kvStore, reddit } = context;
+  console.log('autoCleanStaleUsers: starting');
+
+  if (!kvStore) {
+    console.log('autoCleanStaleUsers: kvStore missing');
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: '[CommentGuardian] Auto-clean failed – KV not available',
+      bodyMarkdown:
+        'KV is not available for CommentGuardian. Please check Devvit.configure and permissions.',
+    });
+    return;
+  }
+
+  const resetWindowMs = await getResetWindowMs(context);
+  if (resetWindowMs == null) {
+    console.log('autoCleanStaleUsers: no reset window configured');
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: '[CommentGuardian] Auto-clean skipped – no reset window',
+      bodyMarkdown:
+        'Auto-clean could not run because `score_reset_days` is not set or is 0. Set a positive number of days to enable automatic resetting.',
+    });
+    return;
+  }
+
+  let users =
+    ((await kvStore.get<string[]>(CONDUCT_USERS_KEY)) as string[] | undefined) ??
+    [];
+  users = users.filter((u) => u && u !== '[unknown]');
+  console.log('autoCleanStaleUsers: users from index =', users);
+
+  if (users.length === 0) {
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: '[CommentGuardian] Auto-clean completed – no tracked users',
+      bodyMarkdown:
+        'Auto-clean ran successfully but there are no tracked users in CommentGuardian.',
+    });
+    return;
+  }
+
+  const now = Date.now();
+  const cleaned: string[] = [];
+  const skipped: string[] = [];
+
+  for (const uname of users) {
+    const key = conductKeyForUser(uname);
+    const stored = (await kvStore.get<UserConduct>(key)) ?? undefined;
+
+    if (!stored || !stored.lastUpdated) {
+      console.log(
+        'autoCleanStaleUsers: no stored conduct or lastUpdated for',
+        uname
+      );
+      skipped.push(uname);
+      continue;
+    }
+
+    const last = new Date(stored.lastUpdated).getTime();
+    const age = now - last;
+
+    console.log(
+      'autoCleanStaleUsers: user =',
+      uname,
+      'age ms =',
+      age,
+      'resetWindowMs =',
+      resetWindowMs
+    );
+
+    if (age > resetWindowMs) {
+      console.log(
+        'autoCleanStaleUsers: resetting user due to age exceeding window:',
+        uname
+      );
+
+      await clearUserHistory(context, uname);
+
+      const reset: UserConduct = {
+        score: 0,
+        scamFlags: 0,
+        harassmentFlags: 0,
+        valueFlags: 0,
+        lastUpdated: new Date().toISOString(),
+      };
+      await kvStore.put(key, reset);
+      cleaned.push(uname);
+    } else {
+      skipped.push(uname);
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push('**CommentGuardian auto-clean summary**', '');
+
+  lines.push(`• Tracked users: ${users.length}`);
+  lines.push(`• Reset users: ${cleaned.length}`);
+  lines.push(`• Unchanged users: ${skipped.length}`, '');
+
+  if (cleaned.length > 0) {
+    lines.push('Reset users:', '');
+    cleaned.forEach((u) => lines.push(`- u/${u}`));
+  } else {
+    lines.push('No users needed resetting based on score_reset_days.');
+  }
+
+  await reddit.modMail.createModInboxConversation({
+    subredditId,
+    subject: '[CommentGuardian] Auto-clean completed',
+    bodyMarkdown: lines.join('\n'),
+  });
+
+  console.log('autoCleanStaleUsers: completed, cleaned =', cleaned.length);
+}
+
 // ---------- Mod-only check for commands (mods only) ----------
 
 async function isCommandUserAllowed(
@@ -582,7 +700,15 @@ async function isCommandUserAllowed(
   return isMod;
 }
 
-// ---------- Mod commands (top offenders, threshold, user report, reset) ----------
+// ---------- Mod commands ----------
+//
+// Commands:
+//  !cg-top                → top 20 offenders (all-time)
+//  !cg-user username      → detailed report + links
+//  !cg-over N             → all users with score ≥ N
+//  !cg-reset username     → reset one user (score + history)
+//  !cg-clean              → run auto-clean now based on score_reset_days
+//  !cg-deduct username N  → subtract N points from a user (but not below 0)
 
 async function commandTopOffenders(
   context: Devvit.Context,
@@ -821,13 +947,83 @@ async function commandResetUser(
   });
 }
 
+// NEW: generic score adjustment helper
+async function commandAdjustScore(
+  context: Devvit.Context,
+  subredditId: string,
+  username: string,
+  delta: number
+): Promise<void> {
+  const { reddit, kvStore } = context;
+  const uname = username.replace(/^u\//i, '');
+  console.log('commandAdjustScore: adjusting score for', uname, 'delta =', delta);
+
+  if (!kvStore) {
+    await reddit.modMail.createModInboxConversation({
+      subredditId,
+      subject: '[CommentGuardian] Adjust score – KV not available',
+      bodyMarkdown:
+        'KV is not available for this app. Please check Devvit.configure and permissions.',
+    });
+    return;
+  }
+
+  // Get current conduct
+  const conduct = await getUserConduct(context, uname);
+  const oldScore = conduct.score;
+
+  // Apply delta, but never go below 0
+  const newScore = Math.max(0, oldScore + delta);
+  conduct.score = newScore;
+  conduct.lastUpdated = new Date().toISOString();
+
+  // Save updated conduct
+  await kvStore.put(conductKeyForUser(uname), conduct);
+
+  // Log a "manual adjustment" event so it shows up in !cg-user history
+  const eventsKey = conductEventsKeyForUser(uname);
+  const existingEvents =
+    ((await kvStore.get<ConductEvent[]>(eventsKey)) as ConductEvent[] |
+      undefined) ?? [];
+
+  const manualEvent: ConductEvent = {
+    commentId: 'manual-adjust',
+    permalink: '',
+    flags: [],
+    delta,
+    createdAt: new Date().toISOString(),
+    commentSnippet: `Manual score adjustment by mods: ${
+      delta > 0 ? '+' : ''
+    }${delta} points`,
+    postTitle: 'Manual adjustment',
+  };
+
+  const updatedEvents = [...existingEvents, manualEvent];
+  const MAX_EVENTS = 20;
+  const trimmedEvents =
+    updatedEvents.length > MAX_EVENTS
+      ? updatedEvents.slice(updatedEvents.length - MAX_EVENTS)
+      : updatedEvents;
+
+  await kvStore.put(eventsKey, trimmedEvents);
+
+  // Confirm via modmail
+  const lines: string[] = [];
+  lines.push(
+    `Score for u/${uname} adjusted by ${delta > 0 ? '+' : ''}${delta} points.`,
+    '',
+    `• Old score: ${oldScore}`,
+    `• New score: ${newScore}`
+  );
+
+  await reddit.modMail.createModInboxConversation({
+    subredditId,
+    subject: `[CommentGuardian] Score adjusted for u/${uname}`,
+    bodyMarkdown: lines.join('\n'),
+  });
+}
+
 // ---------- Command handler (mods only, + optional auto-remove comment) ----------
-//
-// Commands:
-//  !cg-top                → top 20 offenders (all-time)
-//  !cg-user username      → detailed report + links
-//  !cg-over N             → all users with score ≥ N
-//  !cg-reset username     → reset one user (score + history)
 
 async function handleModCommand(
   event: CommentCreate,
@@ -897,7 +1093,8 @@ async function handleModCommand(
           await reddit.modMail.createModInboxConversation({
             subredditId: subreddit.id,
             subject: '[CommentGuardian] Threshold report – invalid number',
-            bodyMarkdown: 'Usage: `!cg-over 5` (score must be a number).',
+            bodyMarkdown:
+              'Usage: `!cg-over 5` (score must be a number).',
           });
         } else {
           await commandOverThreshold(context, subreddit.id, threshold);
@@ -912,6 +1109,37 @@ async function handleModCommand(
         });
       } else {
         await commandResetUser(context, subreddit.id, args[0]);
+      }
+    } else if (cmd === '!cg-clean') {
+      await autoCleanStaleUsers(context, subreddit.id);
+    } else if (cmd === '!cg-deduct') {
+      // Usage: !cg-deduct u/username 5
+      if (args.length < 2) {
+        await reddit.modMail.createModInboxConversation({
+          subredditId: subreddit.id,
+          subject: '[CommentGuardian] Deduct score – missing arguments',
+          bodyMarkdown:
+            'Usage: `!cg-deduct username points` (e.g. `!cg-deduct u/example 5`).',
+        });
+      } else {
+        const targetUser = args[0];
+        const amount = parseInt(args[1], 10);
+
+        if (isNaN(amount) || amount <= 0) {
+          await reddit.modMail.createModInboxConversation({
+            subredditId: subreddit.id,
+            subject: '[CommentGuardian] Deduct score – invalid amount',
+            bodyMarkdown:
+              'Points must be a positive integer. Example: `!cg-deduct u/example 5`.',
+          });
+        } else {
+          await commandAdjustScore(
+            context,
+            subreddit.id,
+            targetUser,
+            -amount
+          );
+        }
       }
     } else {
       console.log('handleModCommand: unknown command, doing nothing');
