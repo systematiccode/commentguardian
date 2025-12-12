@@ -31,142 +31,283 @@ function conductEventsKeyForUser(username: string): string {
   return `conduct_events:${username.toLowerCase()}`;
 }
 
+function autoReplyKey(username: string, postId: string): string {
+  return `autoreply:${username.toLowerCase()}:${postId}`;
+}
+
+const DEFAULT_AUTO_REPLY_TEXT =
+  "Hi u/{username}, friendly reminder from r/{subreddit}:\n\n" +
+  "- Feedback on trade value is welcome, but please keep it **polite** and focused on the **Pokémon**, not the person.\n" +
+  "- Avoid calling people scammers unless there is clear evidence of a rule-breaking scam.\n\n" +
+  "If you have concerns about a trade, please **report the post or comment** and let the mod team review it.";
+
 // ---------- Settings ----------
 
 Devvit.addSettings([
-  // --- Scam accusations ---
+  //
+  // 🔹 Detection & Scoring
+  //
   {
-    type: 'string',
-    name: 'scam_phrases',
-    label: 'Scam accusation phrases (comma or newline separated)',
-    scope: SettingScope.Installation,
-    defaultValue:
-      'scammer,this is a scam,such a scam,you are scamming,youre scamming',
-  },
-  {
-    type: 'boolean',
-    name: 'enable_scam_flags',
-    label: 'Scam accusations: enable detection & scoring',
-    scope: SettingScope.Installation,
-    defaultValue: true,
-  },
-  {
-    type: 'string',
-    name: 'score_scam',
-    label: 'Scam accusations: score weight (integer, default 3)',
-    scope: SettingScope.Installation,
-    defaultValue: '3',
+    type: 'group',
+    label: 'Detection & scoring',
+    fields: [
+      {
+        type: 'string',
+        name: 'scam_phrases',
+        label: 'Scam accusation phrases',
+        scope: SettingScope.Installation,
+        defaultValue:
+          'scammer,this is a scam,such a scam,you are scamming,youre scamming',
+        helpText:
+          'Comma or newline separated list. These phrases will be treated as scam accusations.',
+      },
+      {
+        type: 'boolean',
+        name: 'enable_scam_flags',
+        label: 'Enable scam accusation detection & scoring',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+      },
+      {
+        type: 'string',
+        name: 'score_scam',
+        label: 'Scam accusation score weight',
+        scope: SettingScope.Installation,
+        defaultValue: '3',
+        helpText: 'Integer. Default is 3 points per flagged comment.',
+      },
+
+      {
+        type: 'string',
+        name: 'harassment_phrases',
+        label: 'Harassment / insult phrases',
+        scope: SettingScope.Installation,
+        defaultValue:
+          'are you stupid,you are stupid,youre stupid,you are dumb,youre dumb,you must be blind,touch grass',
+        helpText:
+          'Comma or newline separated list of phrases that count as harassment/insults.',
+      },
+      {
+        type: 'boolean',
+        name: 'enable_harassment_flags',
+        label: 'Enable harassment detection & scoring',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+      },
+      {
+        type: 'string',
+        name: 'score_harassment',
+        label: 'Harassment score weight',
+        scope: SettingScope.Installation,
+        defaultValue: '4',
+        helpText: 'Integer. Default is 4 points per flagged comment.',
+      },
+
+      {
+        type: 'string',
+        name: 'value_policing_phrases',
+        label: 'Aggressive value-policing phrases',
+        scope: SettingScope.Installation,
+        defaultValue:
+          'ripoff,rip-off,trash offer,clown trade,terrible value,insane offer,this is ridiculous,greedy',
+        helpText:
+          'Comma or newline separated list of phrases used for aggressive value policing.',
+      },
+      {
+        type: 'boolean',
+        name: 'enable_policing_flags',
+        label: 'Enable value-policing detection & scoring',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+      },
+      {
+        type: 'string',
+        name: 'score_policing',
+        label: 'Value-policing score weight',
+        scope: SettingScope.Installation,
+        defaultValue: '1',
+        helpText: 'Integer. Default is 1 point per flagged comment.',
+      },
+    ],
   },
 
-  // --- Harassment / insults ---
+  //
+  // 🔹 Moderation Actions & Filters
+  //
   {
-    type: 'string',
-    name: 'harassment_phrases',
-    label: 'Harassment / insult phrases (comma or newline separated)',
-    scope: SettingScope.Installation,
-    defaultValue:
-      'are you stupid,you are stupid,youre stupid,you are dumb,youre dumb,you must be blind,touch grass',
-  },
-  {
-    type: 'boolean',
-    name: 'enable_harassment_flags',
-    label: 'Harassment: enable detection & scoring',
-    scope: SettingScope.Installation,
-    defaultValue: true,
-  },
-  {
-    type: 'string',
-    name: 'score_harassment',
-    label: 'Harassment: score weight (integer, default 4)',
-    scope: SettingScope.Installation,
-    defaultValue: '4',
-  },
-
-  // --- Value policing ---
-  {
-    type: 'string',
-    name: 'value_policing_phrases',
-    label: 'Aggressive value policing phrases (comma or newline separated)',
-    scope: SettingScope.Installation,
-    defaultValue:
-      'ripoff,rip-off,trash offer,clown trade,terrible value,insane offer,this is ridiculous,greedy',
-  },
-  {
-    type: 'boolean',
-    name: 'enable_policing_flags',
-    label: 'Value policing: enable detection & scoring',
-    scope: SettingScope.Installation,
-    defaultValue: true,
-  },
-  {
-    type: 'string',
-    name: 'score_policing',
-    label: 'Value policing: score weight (integer, default 1)',
-    scope: SettingScope.Installation,
-    defaultValue: '1',
+    type: 'group',
+    label: 'Moderation actions & filters',
+    fields: [
+      {
+        type: 'boolean',
+        name: 'notify_via_modmail',
+        label: 'Send Modmail alerts for flagged comments',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, each flagged comment will generate a Modmail thread.',
+      },
+      {
+        type: 'boolean',
+        name: 'report_to_modqueue',
+        label: 'Create a report in modqueue for flagged comments',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, flagged comments will appear in the subreddit modqueue.',
+      },
+      {
+        type: 'string',
+        name: 'monitored_post_flairs',
+        label: 'Only monitor specific POST flairs',
+        scope: SettingScope.Installation,
+        defaultValue: '',
+        helpText:
+          'Comma or newline separated list of post flair texts. If set, only comments on posts with these flairs are monitored.',
+      },
+      {
+        type: 'boolean',
+        name: 'delete_command_comments',
+        label: 'Auto-remove !cg-* command comments from mods',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, the bot will remove mod command comments like !cg-top, !cg-user, etc. after processing.',
+      },
+    ],
   },
 
-  // --- Global behaviour & filters ---
+  //
+  // 🔹 Score Reset & Threshold Alerts
+  //
   {
-    type: 'boolean',
-    name: 'notify_via_modmail',
-    label: 'Send Modmail alerts for flagged comments',
-    scope: SettingScope.Installation,
-    defaultValue: false,
-  },
-  {
-    type: 'boolean',
-    name: 'report_to_modqueue',
-    label: 'Create a report in modqueue for flagged comments',
-    scope: SettingScope.Installation,
-    defaultValue: true,
-  },
-  {
-    type: 'string',
-    name: 'monitored_post_flairs',
-    label:
-      'Only monitor comments on posts with these POST FLAIR texts (comma or newline separated). Leave blank to monitor all posts.',
-    scope: SettingScope.Installation,
-    defaultValue: '',
-  },
-  {
-    type: 'string',
-    name: 'score_reset_days',
-    label:
-      'Days after which a user score is reset (e.g. 90). Leave blank or 0 to never auto-reset.',
-    scope: SettingScope.Installation,
-    defaultValue: '',
-  },
-  {
-    type: 'boolean',
-    name: 'delete_command_comments',
-    label: 'Auto-remove !cg-* command comments from mods',
-    scope: SettingScope.Installation,
-    defaultValue: true,
+    type: 'group',
+    label: 'Score reset & alerts',
+    fields: [
+      {
+        type: 'string',
+        name: 'score_reset_days',
+        label: 'Score reset window (days)',
+        scope: SettingScope.Installation,
+        defaultValue: '',
+        helpText:
+          'Number of days after which a user score is reset. Leave blank or 0 to never auto-reset.',
+      },
+      {
+        type: 'boolean',
+        name: 'alert_threshold_enabled',
+        label: 'Enable score threshold alerts (Modmail)',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, the bot will send Modmail when a user crosses the threshold score.',
+      },
+      {
+        type: 'string',
+        name: 'alert_threshold_score',
+        label: 'Threshold score',
+        scope: SettingScope.Installation,
+        defaultValue: '',
+        helpText:
+          'Score at which to alert mods (e.g., 20). Leave blank or 0 to disable alerts.',
+      },
+    ],
   },
 
-  // --- Threshold alert config (Stage 2 #1) ---
+  //
+  // 🔹 Auto Replies & Behaviour (what we were calling Stage 3)
+  //
   {
-    type: 'boolean',
-    name: 'alert_threshold_enabled',
-    label: 'Enable score threshold alerts (modmail when a user crosses a score)',
-    scope: SettingScope.Installation,
-    defaultValue: false,
-  },
-  {
-    type: 'string',
-    name: 'alert_threshold_score',
-    label:
-      'Alert threshold score (e.g., 20). Leave blank or 0 to disable alerts.',
-    scope: SettingScope.Installation,
-    defaultValue: '',
+    type: 'group',
+    label: 'Auto replies & behaviour',
+    fields: [
+      {
+        type: 'boolean',
+        name: 'auto_reply_enabled',
+        label: 'Enable auto-reply to flagged comments',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, the bot will reply to some flagged comments with a gentle reminder.',
+      },
+      {
+        type: 'select',
+        name: 'auto_reply_cooldown_mode',
+        label: 'Auto-reply cooldown mode',
+        scope: SettingScope.Installation,
+        defaultValue: 'per_user_post',
+        options: [
+          { label: 'Global (one cooldown shared across all users/posts)', value: 'global' },
+          { label: 'Per user per post (recommended)', value: 'per_user_post' },
+        ],
+        helpText:
+          'Controls how auto-reply cooldown is tracked. Global helps during bursts; Per user per post avoids one noisy thread stopping reminders elsewhere.',
+      },
+
+      {
+        type: 'string',
+        name: 'auto_reply_text',
+        label: 'Auto-reply text (Markdown)',
+        scope: SettingScope.Installation,
+        defaultValue: DEFAULT_AUTO_REPLY_TEXT,
+        helpText:
+          'You can use {username} and {subreddit} placeholders. This text will be posted as the bot reply.',
+      },
+      {
+        type: 'string',
+        name: 'behavior_window_days',
+        label: 'Behaviour window (days)',
+        scope: SettingScope.Installation,
+        defaultValue: '30',
+        helpText:
+          'Number of days to consider when deciding if someone is a “first” or “repeat” offender.',
+      },
+      {
+        type: 'boolean',
+        name: 'auto_reply_on_first_offense',
+        label: 'Reply on first offense within window',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, the bot will reply even on the first flagged comment in the behaviour window.',
+      },
+      {
+        type: 'boolean',
+        name: 'auto_reply_on_repeat_offense',
+        label: 'Reply on repeat offenses within window',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, the bot will reply when the same user is flagged multiple times within the behaviour window.',
+      },
+      {
+        type: 'boolean',
+        name: 'auto_reply_once_per_thread',
+        label: 'Only reply once per user per post',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, the bot will only reply once to a given user in a given post thread.',
+      },
+      {
+        type: 'string',
+        name: 'bot_username',
+        label: 'Bot username (for loop prevention)',
+        scope: SettingScope.Installation,
+        defaultValue: 'commentguardian',
+        helpText:
+          'Exact Reddit username of the bot account running this Devvit app. Used to avoid the bot replying to itself.',
+      },
+
+    ],
   },
 ]);
+
 
 Devvit.configure({
   redditAPI: true,
   modMail: true,
-  kvStore: true,
+  kv: true,
 });
 
 // ---------- Helpers: settings & parsing ----------
@@ -206,6 +347,26 @@ async function getResetWindowMs(
 
   const ms = days * 24 * 60 * 60 * 1000;
   console.log('getResetWindowMs: parsed days =', days, 'ms =', ms);
+  return ms;
+}
+
+async function getBehaviorWindowMs(
+  context: Devvit.Context
+): Promise<number | null> {
+  const raw = (await context.settings.get(
+    'behavior_window_days'
+  )) as string | undefined;
+  console.log('getBehaviorWindowMs: raw behavior_window_days =', raw);
+
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const days = parseInt(trimmed, 10);
+  if (isNaN(days) || days <= 0) return null;
+
+  const ms = days * 24 * 60 * 60 * 1000;
+  console.log('getBehaviorWindowMs: parsed days =', days, 'ms =', ms);
   return ms;
 }
 
@@ -274,13 +435,11 @@ async function resolveUsername(
     (comment as any).authorName
   );
 
-  // 1) event.author.name
   if (eventAuthor?.name) {
     console.log('resolveUsername: using event.author.name =', eventAuthor.name);
     return eventAuthor.name;
   }
 
-  // 2) API-backed method
   try {
     if ((comment as any).getAuthorName) {
       const apiName = await (comment as any).getAuthorName();
@@ -296,13 +455,11 @@ async function resolveUsername(
     console.log('resolveUsername: getAuthorName() threw error:', err);
   }
 
-  // 3) comment.author.name
   if (comment.author?.name) {
     console.log('resolveUsername: using comment.author.name =', comment.author.name);
     return comment.author.name;
   }
 
-  // 4) comment.authorName
   if ((comment as any).authorName) {
     console.log(
       'resolveUsername: using comment.authorName =',
@@ -313,6 +470,168 @@ async function resolveUsername(
 
   console.log('resolveUsername: username missing (fallbacks failed)');
   return undefined;
+}
+
+// ---------- Stage 3 helpers: reply text validation + rate-limit safe retry ----------
+
+const AUTO_REPLY_COOLDOWN_UNTIL_BASE = 'autoreply_cooldown_until';
+
+function autoReplyCooldownKey(mode: string, usernameLower: string | undefined, postId: string | undefined): string {
+  if (mode === 'per_user_post' && usernameLower && postId) {
+    return `${AUTO_REPLY_COOLDOWN_UNTIL_BASE}:${usernameLower}:${postId}`;
+  }
+  return AUTO_REPLY_COOLDOWN_UNTIL_BASE;
+}
+
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRateLimitSeconds(err: any): number | null {
+  const details =
+    (err && (err.details || err.message || String(err))) as string | undefined;
+  if (!details) return null;
+
+  // Examples we’ve seen:
+  // "RATELIMIT: ... Take a break for 5 seconds ..."
+  const m = details.match(/break for\s+(\d+)\s+seconds?/i);
+  if (m && m[1]) {
+    const n = parseInt(m[1], 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  return null;
+}
+
+function isRateLimitError(err: any): boolean {
+  const details = (err && (err.details || err.message || '')) as string;
+  return /RATELIMIT/i.test(details);
+}
+
+function isNoTextError(err: any): boolean {
+  const details = (err && (err.details || err.message || '')) as string;
+  return /NO_TEXT/i.test(details);
+}
+
+function buildAutoReplyBody(
+  templateSource: string,
+  username: string,
+  subredditName: string
+): string {
+  // Strict validation to prevent NO_TEXT and other empty-text issues.
+  const safeTemplate = (templateSource ?? '').toString();
+  const rendered = safeTemplate
+    .replace(/{username}/g, username)
+    .replace(/{subreddit}/g, subredditName)
+    // Normalize line endings
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+
+  const finalText = rendered.length > 0 ? `${rendered}
+
+<!-- CommentGuardian:auto-reply -->` : '';
+
+  return finalText;
+}
+
+async function getAutoReplyCooldownUntilMs(
+  context: Devvit.Context,
+  key: string
+): Promise<number> {
+  const kv = context.kvStore;
+  if (!kv) return 0;
+  const v = await kv.get<string>(key);
+  if (!v) return 0;
+  const n = parseInt(v, 10);
+  if (isNaN(n) || n <= 0) return 0;
+  return n;
+}
+
+async function setAutoReplyCooldownSeconds(
+  context: Devvit.Context,
+  key: string,
+  seconds: number
+): Promise<void> {
+  const kv = context.kvStore;
+  if (!kv) return;
+  const s = Math.max(1, Math.min(3600, seconds)); // cap at 1h
+  const until = Date.now() + s * 1000;
+  await kv.put(key, String(until));
+  console.log(
+    'Stage3: global auto-reply cooldown set for',
+    s,
+    'seconds. untilMs =',
+    until
+  );
+}
+
+async function submitAutoReplyWithRetry(
+  context: Devvit.Context,
+  parentCommentId: string,
+  replyBody: string,
+  usernameForLogs: string,
+  cooldownKey: string
+): Promise<void> {
+  // IMPORTANT: Avoid using Comment.reply(string) because we’ve seen NO_TEXT even with non-empty strings.
+  // Using submitComment with explicit {text} prevents the "NO_TEXT" gRPC error.
+  const reddit = context.reddit;
+
+  const trimmed = (replyBody ?? '').toString().trim();
+  if (!trimmed) {
+    console.log(
+      'Stage3: submitAutoReplyWithRetry: replyBody empty after trim, skipping'
+    );
+    return;
+  }
+
+  // Single short retry for RATELIMIT.
+  const maxAttempts = 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(
+        'Stage3: posting auto-reply attempt',
+        attempt,
+        'for',
+        usernameForLogs,
+        'len=',
+        trimmed.length
+      );
+
+      // @ts-ignore - submitComment exists in Devvit Reddit API runtime
+      await (reddit as any).submitComment({ id: parentCommentId, text: trimmed });
+      console.log('Stage3: auto-reply posted successfully for', usernameForLogs);
+      return;
+    } catch (err) {
+      console.error('Stage3: error posting auto-reply (attempt ' + attempt + ')', err);
+
+      // NO_TEXT should never retry: it means text wasn’t passed correctly.
+      if (isNoTextError(err)) {
+        console.log('Stage3: NO_TEXT error detected; will not retry');
+        return;
+      }
+
+      if (isRateLimitError(err)) {
+        const sec = parseRateLimitSeconds(err) ?? 5;
+        // Set a global cooldown so we don’t hammer replies during bursts.
+        await setAutoReplyCooldownSeconds(context, cooldownKey, sec + 1);
+        // Also set a global cooldown to respect account-wide limits.
+        if (cooldownKey !== AUTO_REPLY_COOLDOWN_UNTIL_BASE) {
+          await setAutoReplyCooldownSeconds(context, AUTO_REPLY_COOLDOWN_UNTIL_BASE, sec + 1);
+        }
+
+        if (attempt < maxAttempts) {
+          const waitSec = Math.min(10, sec + 1);
+          console.log('Stage3: RATELIMIT detected; waiting', waitSec, 'seconds then retry');
+          await sleepMs(waitSec * 1000);
+          continue;
+        }
+      }
+
+      // For any other error, do not retry (avoid loops).
+      return;
+    }
+  }
 }
 
 // ---------- Classifier (Stage 1) ----------
@@ -582,7 +901,7 @@ async function getUserEvents(
   return events;
 }
 
-// ---------- Auto-clean helper (Stage 2 #1 baseline) ----------
+// ---------- Auto-clean helper ----------
 
 async function autoCleanStaleUsers(
   context: Devvit.Context,
@@ -749,13 +1068,12 @@ async function isCommandUserAllowed(
 
 // ---------- Mod commands ----------
 //
-// Commands:
 //  !cg-top                → top 20 offenders (all-time)
 //  !cg-user username      → detailed report + links
 //  !cg-over N             → all users with score ≥ N
 //  !cg-reset username     → reset one user (score + history)
 //  !cg-clean              → run auto-clean now based on score_reset_days
-//  !cg-deduct username N  → subtract N points from a user (but not below 0)
+//  !cg-deduct username N  → subtract N points from a user (not below 0)
 //  !cg-add username N     → add N points to a user (manual adjustment)
 
 async function commandTopOffenders(
@@ -1067,7 +1385,7 @@ async function commandAdjustScore(
   });
 }
 
-// ---------- Command handler (mods only, + optional auto-remove) ----------
+// ---------- Command handler ----------
 
 async function handleModCommand(
   event: CommentCreate,
@@ -1283,7 +1601,26 @@ Devvit.addTrigger({
       subreddit.name,
       'rawBody =',
       rawBody
-    );
+    )
+
+    // 🔁 Loop prevention: never process the bot's own comments or its auto-reply marker
+    const skipBotComments = true;
+    const botUsernameRaw = (await settings.get('bot_username')) as string | undefined;
+    const botUsername = (botUsernameRaw ?? '').trim().toLowerCase();
+    const eventAuthorName = event.author?.name;
+    const eventAuthorLower = (eventAuthorName ?? '').toLowerCase();
+
+    if (skipBotComments) {
+      if (botUsername && eventAuthorLower === botUsername) {
+        console.log('CommentCreate: skipping bot-authored comment to prevent loops', eventAuthorName);
+        return;
+      }
+      if (bodyLower.includes('<!-- commentguardian:auto-reply -->')) {
+        console.log('CommentCreate: skipping comment with auto-reply marker to prevent loops');
+        return;
+      }
+    }
+;
 
     // 0) Commands
     if (bodyLower.startsWith('!cg-')) {
@@ -1345,7 +1682,7 @@ Devvit.addTrigger({
 
     const nowIso = new Date().toISOString();
 
-    // Threshold config for possible alert
+    // Threshold config
     const threshold = await getAlertThreshold(context);
     console.log('CommentCreate: threshold from settings =', threshold);
 
@@ -1573,6 +1910,200 @@ Devvit.addTrigger({
           err
         );
       }
+    }
+
+    // ================
+    // STAGE 3 – Auto reply logic
+    // ================
+
+    if (username) {
+      const autoReplyEnabled = (await settings.get(
+        'auto_reply_enabled'
+      )) as boolean | undefined;
+
+      if (autoReplyEnabled) {
+        console.log(
+          'CommentCreate: Stage 3 auto-reply enabled, evaluating for user',
+          username
+        );
+
+        // Auto-reply cooldown (configurable: global vs per user per post)
+        const cooldownModeRaw = await settings.get('auto_reply_cooldown_mode');
+        let cooldownModeStr = 'per_user_post';
+        if (typeof cooldownModeRaw === 'string') {
+          cooldownModeStr = cooldownModeRaw;
+        } else if (
+          cooldownModeRaw &&
+          typeof cooldownModeRaw === 'object' &&
+          'value' in (cooldownModeRaw as any) &&
+          typeof (cooldownModeRaw as any).value === 'string'
+        ) {
+          // Some Devvit settings UIs may return { value, label }
+          cooldownModeStr = (cooldownModeRaw as any).value;
+        } else if (cooldownModeRaw != null) {
+          cooldownModeStr = String(cooldownModeRaw);
+        }
+        const cooldownMode = cooldownModeStr.trim().toLowerCase();
+        const usernameLower = username.toLowerCase();
+        const postIdForCooldown = post?.id ?? comment.postId ?? event.comment?.postId;
+        const cooldownKey = autoReplyCooldownKey(cooldownMode, usernameLower, postIdForCooldown);
+
+        const cooldownUntil = await getAutoReplyCooldownUntilMs(context, cooldownKey);
+        if (cooldownUntil > Date.now()) {
+          console.log(
+            'CommentCreate: Stage 3 auto-reply skipped due to cooldown. cooldownUntilMs =',
+            cooldownUntil
+          );
+          console.log('CommentCreate: END (normal path)');
+          return;
+        }
+
+        // ---- Stage 3 HARD GUARD: never auto-reply to replies (prevents loops) ----
+        const parentId = (comment as any)?.parentId ?? (event as any)?.comment?.parentId;
+        if (parentId && String(parentId).startsWith('t1_')) {
+          console.log(
+            'Stage3: skipping auto-reply because comment is a reply (parentId=',
+            parentId,
+            ')'
+          );
+          console.log('CommentCreate: END (normal path)');
+          return;
+        }
+
+        const behaviorWindowMs = await getBehaviorWindowMs(context);
+        const allEvents = await getUserEvents(context, username);
+        const now = Date.now();
+
+        let recentEvents = allEvents;
+        if (behaviorWindowMs != null) {
+          recentEvents = allEvents.filter((ev) => {
+            const t = new Date(ev.createdAt).getTime();
+            return now - t <= behaviorWindowMs;
+          });
+        }
+
+        // We just added this comment as the last event; treat "prior" as everything except the newest.
+        const priorRecentCount = Math.max(0, recentEvents.length - 1);
+        const isFirstOffense = priorRecentCount === 0;
+
+        const onFirst =
+          ((await settings.get(
+            'auto_reply_on_first_offense'
+          )) as boolean | undefined) === true;
+        const onRepeat =
+          ((await settings.get(
+            'auto_reply_on_repeat_offense'
+          )) as boolean | undefined) !== false;
+
+        console.log(
+          'CommentCreate: Stage 3 offense state',
+          'isFirstOffense =',
+          isFirstOffense,
+          'priorRecentCount =',
+          priorRecentCount,
+          'onFirst =',
+          onFirst,
+          'onRepeat =',
+          onRepeat
+        );
+
+        let shouldReply = false;
+        if (isFirstOffense && onFirst) {
+          shouldReply = true;
+        } else if (!isFirstOffense && onRepeat) {
+          shouldReply = true;
+        }
+
+        if (!shouldReply) {
+          console.log(
+            'CommentCreate: Stage 3 auto-reply not triggered by first/repeat settings'
+          );
+        } else {
+          // Once-per-thread logic
+          const oncePerThread =
+            ((await settings.get(
+              'auto_reply_once_per_thread'
+            )) as boolean | undefined) !== false;
+
+          let skipDueToThread = false;
+          const kv = context.kvStore;
+
+          if (oncePerThread && kv) {
+            const postId = comment.postId;
+            const key = autoReplyKey(username, postId);
+            const marker = await kv.get<string>(key);
+            console.log(
+              'CommentCreate: Stage 3 auto-reply thread key =',
+              key,
+              'marker =',
+              marker
+            );
+
+            if (marker) {
+              skipDueToThread = true;
+            } else {
+              await kv.put(key, new Date().toISOString());
+            }
+          }
+
+          if (skipDueToThread) {
+            console.log(
+              'CommentCreate: Stage 3 auto-reply skipped: already replied in this thread for user',
+              username
+            );
+          } else {
+            const rawTemplate = (await settings.get(
+              'auto_reply_text'
+            )) as string | undefined;
+
+            const templateSource =
+              rawTemplate && rawTemplate.trim().length > 0
+                ? rawTemplate
+                : DEFAULT_AUTO_REPLY_TEXT;
+
+            console.log('Stage3: templateSource =', templateSource);
+
+            const replyBody = buildAutoReplyBody(
+              templateSource,
+              username,
+              subreddit.name
+            );
+
+            console.log(
+              'Stage3: final replyBody length =',
+              replyBody.length,
+              'preview =',
+              replyBody.slice(0, 120)
+            );
+
+            if (!replyBody || replyBody.trim().length === 0) {
+              console.log(
+                'Stage3: replyBody is empty after formatting – skipping auto-reply to avoid NO_TEXT error'
+              );
+            } else {
+              try {
+                await submitAutoReplyWithRetry(
+                  context,
+                  comment.id,
+                  replyBody,
+                  username,
+                  cooldownKey
+                );
+              } catch (err) {
+                console.error('Stage3: error posting auto-reply', err);
+              }
+            }
+          }
+        }
+      } else {
+        console.log(
+          'CommentCreate: Stage 3 auto-reply disabled in settings, skipping reply'
+        );
+      }
+    } else {
+      console.log(
+        'CommentCreate: Stage 3 auto-reply skipped because username is missing'
+      );
     }
 
     console.log('CommentCreate: END (normal path)');
