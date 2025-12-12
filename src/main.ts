@@ -128,6 +128,15 @@ Devvit.addSettings([
         defaultValue: '1',
         helpText: 'Integer. Default is 1 point per flagged comment.',
       },
+      {
+        type: 'string',
+        name: 'score_daily_cap',
+        label: 'Daily score cap (optional)',
+        scope: SettingScope.Installation,
+        defaultValue: '',
+        helpText:
+          'Max points a user can gain per day from CommentGuardian scoring. Leave blank or 0 to disable.',
+      },
     ],
   },
 
@@ -229,6 +238,15 @@ Devvit.addSettings([
         defaultValue: false,
         helpText:
           'If enabled, the bot will reply to some flagged comments with a gentle reminder.',
+      },
+      {
+        type: 'boolean',
+        name: 'auto_reply_retry_enabled',
+        label: 'Retry auto-replies on RATELIMIT',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, failed auto-replies due to RATELIMIT will be queued and retried automatically.',
       },
       {
         type: 'select',
@@ -382,6 +400,39 @@ async function getScoreWeight(
   const value = parseInt(trimmed, 10);
   if (isNaN(value)) return fallback;
   return value;
+}
+
+async function applyDailyScoreCap(
+  context: Devvit.Context,
+  username: string,
+  proposedDelta: number
+): Promise<{ appliedDelta: number; capped: boolean; capValue: number | null }> {
+  const kv = context.kvStore;
+  if (!kv) return { appliedDelta: proposedDelta, capped: false, capValue: null };
+
+  const raw = (await context.settings.get('score_daily_cap')) as string | undefined;
+  const trimmed = (raw ?? '').toString().trim();
+  if (!trimmed) return { appliedDelta: proposedDelta, capped: false, capValue: null };
+
+  const cap = parseInt(trimmed, 10);
+  if (isNaN(cap) || cap <= 0) return { appliedDelta: proposedDelta, capped: false, capValue: null };
+
+  const dayKey = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  const key = `daily_points:${username.toLowerCase()}:${dayKey}`;
+
+  const usedRaw = await kv.get<string>(key);
+  const used = usedRaw ? parseInt(usedRaw, 10) : 0;
+  const safeUsed = isNaN(used) || used < 0 ? 0 : used;
+
+  const remaining = Math.max(0, cap - safeUsed);
+  const applied = Math.max(0, Math.min(remaining, proposedDelta));
+  const capped = applied < proposedDelta;
+
+  if (applied > 0) {
+    await kv.put(key, String(safeUsed + applied));
+  }
+
+  return { appliedDelta: applied, capped, capValue: cap };
 }
 
 async function getAlertThreshold(
@@ -634,7 +685,40 @@ async function submitAutoReplyWithRetry(
   }
 }
 
+// ---------- Matching helpers (no-ML quality improvements) ----------
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function phraseHit(textLower: string, phraseLower: string): boolean {
+  const p = (phraseLower ?? '').trim().toLowerCase();
+  if (!p) return false;
+
+  // If the phrase has whitespace or punctuation, substring match is safest.
+  if (/[^a-z0-9]/i.test(p)) {
+    return textLower.includes(p);
+  }
+
+  // Single token: word boundary match to avoid partial matches.
+  try {
+    const r = new RegExp(`\\b${escapeRegExp(p)}\\b`, 'i');
+    return r.test(textLower);
+  } catch {
+    return textLower.includes(p);
+  }
+}
+
+function phraseListHit(textLower: string, phrases: string[]): boolean {
+  return phrases.some((p) => phraseHit(textLower, p));
+}
+
+function isLikelyScamNegation(textLower: string): boolean {
+  return /\b(not|isn'?t|is\s+not|ain'?t)\s+(a\s+)?scam(ming|mer)?\b/i.test(textLower);
+}
+
 // ---------- Classifier (Stage 1) ----------
+
 
 async function classifyComment(
   body: string,
@@ -1726,6 +1810,22 @@ Devvit.addTrigger({
           conduct.valueFlags += 1;
           delta += policingWeight;
         }
+
+        // Optional fairness guard: cap how many points a user can gain per day
+        const capResult = await applyDailyScoreCap(context, username, delta);
+        if (capResult.capped) {
+          console.log(
+            'CommentCreate: daily cap applied for',
+            username,
+            'cap=',
+            capResult.capValue,
+            'requestedDelta=',
+            delta,
+            'appliedDelta=',
+            capResult.appliedDelta
+          );
+        }
+        delta = capResult.appliedDelta;
 
         conduct.score = (conduct.score ?? 0) + delta;
 
