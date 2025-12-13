@@ -1100,6 +1100,8 @@ async function isCommandUserAllowed(
   }
 
   return isMod;
+}
+
 // ---------- Stage 5.4: delayed vote signal (KV job queue) ----------
 
 async function getVoteSignalConfig(context: Devvit.Context): Promise<{
@@ -1311,9 +1313,6 @@ async function processDueVoteJobs(
   // Save remaining jobs
   await kv.put(VOTE_JOBS_KEY, remaining);
   console.log('Stage5.4: remaining vote jobs after processing =', remaining.length);
-}
-
-
 }
 
 // ---------- Mod commands ----------
