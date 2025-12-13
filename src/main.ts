@@ -19,9 +19,22 @@ interface ConductEvent {
   createdAt: string; // ISO
   commentSnippet?: string;
   postTitle?: string;
+  reason?: string; // optional (e.g., VOTE_SIGNAL)
+}
+
+interface VoteCheckJob {
+  commentId: string;
+  username: string; // lowercase
+  postId: string;
+  permalink: string;
+  flags: FlagType[];
+  createdAt: string; // ISO
+  checkAt: number; // epoch ms
 }
 
 const CONDUCT_USERS_KEY = 'conduct_users';
+const VOTE_JOBS_KEY = 'vote_jobs';
+
 
 function conductKeyForUser(username: string): string {
   return `conduct:${username.toLowerCase()}`;
@@ -217,7 +230,59 @@ Devvit.addSettings([
   //
   // 🔹 Auto Replies & Behaviour (what we were calling Stage 3)
   //
-  {
+    {
+    type: 'group',
+    label: 'Delayed signals (votes)',
+    fields: [
+      {
+        type: 'boolean',
+        name: 'vote_signal_enabled',
+        label: 'Enable delayed vote signal scoring',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, the bot will re-check the score of flagged comments after a delay and may add a small number of extra points if the community reaction is strongly negative. This is a weak signal (never auto-removes).',
+      },
+      {
+        type: 'number',
+        name: 'vote_signal_delay_minutes',
+        label: 'Vote check delay (minutes)',
+        scope: SettingScope.Installation,
+        defaultValue: 60,
+        helpText:
+          'How long after a flagged comment to re-check its score.',
+      },
+      {
+        type: 'number',
+        name: 'vote_signal_score_threshold',
+        label: 'Score threshold (<=)',
+        scope: SettingScope.Installation,
+        defaultValue: -5,
+        helpText:
+          'If the comment score is less than or equal to this value when checked, extra points will be applied.',
+      },
+      {
+        type: 'number',
+        name: 'vote_signal_points',
+        label: 'Extra points to add',
+        scope: SettingScope.Installation,
+        defaultValue: 1,
+        helpText:
+          'Points added to the user score when the delayed score threshold is met.',
+      },
+      {
+        type: 'number',
+        name: 'vote_signal_max_jobs_per_run',
+        label: 'Max vote jobs processed per run',
+        scope: SettingScope.Installation,
+        defaultValue: 3,
+        helpText:
+          'Safety limit: how many queued vote checks to process per new comment event.',
+      },
+    ],
+  },
+
+{
     type: 'group',
     label: 'Auto replies & behaviour',
     fields: [
@@ -268,17 +333,6 @@ Devvit.addSettings([
       },
       {
         type: 'boolean',
-        name: 'auto_reply_include_soft_flags',
-        label: 'Include soft flags (value policing) in auto-replies',
-        scope: SettingScope.Installation,
-        defaultValue: false,
-        helpText:
-          'If disabled (recommended), auto-replies only trigger for hard flags (scam accusations / harassment). Value-policing-only comments will still be reported/scored but will not get an auto-reply.',
-      },
-
-
-      {
-        type: 'boolean',
         name: 'auto_reply_once_per_thread',
         label: 'Only reply once per user per post',
         scope: SettingScope.Installation,
@@ -296,89 +350,6 @@ Devvit.addSettings([
           'Exact Reddit username of the bot account running this Devvit app. Used to avoid the bot replying to itself.',
       },
 
-    ],
-  },
-
-  //
-  // 🔹 Stage 4 — Accuracy
-  //
-  {
-    type: 'group',
-    label: 'Stage 4 — Accuracy',
-    fields: [
-      {
-        type: 'boolean',
-        name: 'enable_word_boundary_matching',
-        label: 'Enable word-boundary matching for single-word phrases',
-        scope: SettingScope.Installation,
-        defaultValue: true,
-        helpText:
-          'Reduces false positives by matching whole words for single-word phrases (e.g., scam, scammer) instead of substring matches.',
-      },
-      {
-        type: 'boolean',
-        name: 'enable_scam_negation_guard',
-        label: 'Enable scam negation/context guard',
-        scope: SettingScope.Installation,
-        defaultValue: true,
-        helpText:
-          'If enabled, phrases like "not a scam" / "stop calling it a scam" will NOT be flagged as scam accusations.',
-      },
-    ],
-  },
-
-  //
-  // 🔹 Stage 5 — Fairness
-  //
-  {
-    type: 'group',
-    label: 'Stage 5 — Fairness',
-    fields: [
-      {
-        type: 'boolean',
-        name: 'enable_trust_adjustment',
-        label: 'Enable trust adjustment (confirmed-trade flair)',
-        scope: SettingScope.Installation,
-        defaultValue: true,
-        helpText:
-          'If enabled, users with high confirmed-trade flair are treated as more trusted for auto-replies and threshold alerts (still reported/scored normally).',
-      },
-      {
-        type: 'number',
-        name: 'trusted_trade_count_min',
-        label: 'Trusted trade count minimum',
-        scope: SettingScope.Installation,
-        defaultValue: 20,
-        helpText:
-          'Minimum confirmed-trade count (from user flair text) for a user to be considered trusted.',
-      },
-      {
-        type: 'number',
-        name: 'trusted_alert_threshold_multiplier',
-        label: 'Trusted alert threshold multiplier',
-        scope: SettingScope.Installation,
-        defaultValue: 2,
-        helpText:
-          'When threshold alerts are enabled, trusted users require threshold × this multiplier to trigger mod alerts.',
-      },
-      {
-        type: 'boolean',
-        name: 'enable_score_decay',
-        label: 'Enable score decay (instead of only hard reset)',
-        scope: SettingScope.Installation,
-        defaultValue: false,
-        helpText:
-          'If enabled, the score will decay over time when a user is loaded (lazy decay). This is optional and can be used alongside score_reset_days.',
-      },
-      {
-        type: 'number',
-        name: 'score_decay_points_per_day',
-        label: 'Score decay points per day',
-        scope: SettingScope.Installation,
-        defaultValue: 1,
-        helpText:
-          'How many points to subtract per day since lastUpdated (floored), when score decay is enabled.',
-      },
     ],
   },
 ]);
@@ -408,62 +379,6 @@ async function loadPhraseList(
 
   console.log('loadPhraseList:', key, 'parsed =', list);
   return list;
-}
-
-
-function normalizeText(input: string): string {
-  // Lowercase, collapse whitespace, and normalize punctuation to spaces
-  return (input ?? '')
-    .toLowerCase()
-    .replace(/[_*`~]/g, ' ') // markdown-ish chars
-    .replace(/[\r\n\t]+/g, ' ')
-    .replace(/[^a-z0-9\s'-]/g, ' ') // keep letters/numbers/space/'/-
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-async function isWordBoundaryEnabled(context: Devvit.Context): Promise<boolean> {
-  const v = (await context.settings.get('enable_word_boundary_matching')) as
-    | boolean
-    | undefined;
-  return v !== false; // default true
-}
-
-function phraseMatches(textNorm: string, phrase: string, useWordBoundary: boolean): boolean {
-  const p = (phrase ?? '').trim().toLowerCase();
-  if (!p) return false;
-
-  // Multi-word phrase: use includes on normalized text
-  if (p.includes(' ')) {
-    return textNorm.includes(p);
-  }
-
-  if (!useWordBoundary) {
-    return textNorm.includes(p);
-  }
-
-  // Single word: enforce word boundary
-  const re = new RegExp(`\\b${escapeRegex(p)}\\b`, 'i');
-  return re.test(textNorm);
-}
-
-function scamNegationOrContext(textNorm: string): boolean {
-  // If the comment is discouraging scam accusations, don't flag it as a scam accusation.
-  // Keep this intentionally small + high-signal.
-  const patterns: RegExp[] = [
-    /\bnot\s+a\s+scam\b/i,
-    /\bisn'?t\s+a\s+scam\b/i,
-    /\bno\s+scam\b/i,
-    /\bstop\s+calling\b.*\bscam\b/i,
-    /\bdon'?t\s+call\b.*\bscam\b/i,
-    /\bavoid\s+calling\b.*\bscam\b/i,
-    /\bplease\s+don'?t\s+call\b.*\bscam\b/i,
-  ];
-  return patterns.some((re) => re.test(textNorm));
 }
 
 async function getResetWindowMs(
@@ -607,83 +522,6 @@ async function resolveUsername(
   console.log('resolveUsername: username missing (fallbacks failed)');
   return undefined;
 }
-
-
-function extractFlairTextFromEvent(event: CommentCreate, comment: any): string {
-  const eventAuthor: any = (event as any).author;
-
-  const candidates: any[] = [
-    eventAuthor?.flair?.text,
-    eventAuthor?.flairText,
-    eventAuthor?.userFlairText,
-    (comment as any)?.authorFlair?.text,
-    (comment as any)?.authorFlairText,
-    (event as any)?.authorFlair?.text,
-    (event as any)?.authorFlairText,
-  ];
-
-  for (const c of candidates) {
-    if (typeof c === 'string' && c.trim().length > 0) {
-      return c.trim();
-    }
-  }
-  return '';
-}
-
-function parseTradeCountFromFlairText(flairText: string): number | null {
-  if (!flairText) return null;
-  const m = flairText.match(/(\d{1,6})/);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  return Number.isFinite(n) ? n : null;
-}
-
-async function getTrustContext(
-  context: Devvit.Context,
-  event: CommentCreate,
-  comment: any,
-  username?: string
-): Promise<{ isTrusted: boolean; tradeCount: number | null; flairText: string }> {
-  const enabled =
-    ((await context.settings.get('enable_trust_adjustment')) as boolean | undefined) !== false;
-
-  const flairText = extractFlairTextFromEvent(event, comment);
-  const tradeCount = parseTradeCountFromFlairText(flairText);
-
-  const minTrustedRaw = (await context.settings.get(
-    'trusted_trade_count_min'
-  )) as number | undefined;
-  const minTrusted = typeof minTrustedRaw === 'number' && minTrustedRaw > 0 ? minTrustedRaw : 20;
-
-  const isTrusted = enabled && tradeCount != null && tradeCount >= minTrusted;
-
-  console.log(
-    'trustContext:',
-    'enabled=',
-    enabled,
-    'user=',
-    username,
-    'flairText=',
-    flairText,
-    'tradeCount=',
-    tradeCount,
-    'minTrusted=',
-    minTrusted,
-    'isTrusted=',
-    isTrusted
-  );
-
-  return { isTrusted, tradeCount, flairText };
-}
-
-async function getTrustedThresholdMultiplier(context: Devvit.Context): Promise<number> {
-  const raw = (await context.settings.get(
-    'trusted_alert_threshold_multiplier'
-  )) as number | undefined;
-  if (typeof raw === 'number' && raw >= 1) return raw;
-  return 2;
-}
-
 
 // ---------- Stage 3 helpers: reply text validation + rate-limit safe retry ----------
 
@@ -838,10 +676,8 @@ async function classifyComment(
   body: string,
   context: Devvit.Context
 ): Promise<FlagType[]> {
+  const text = body.toLowerCase();
   console.log('classifyComment: body =', body);
-
-  const textNorm = normalizeText(body);
-  const useWordBoundary = await isWordBoundaryEnabled(context);
 
   const scamWords = await loadPhraseList(context, 'scam_phrases', [
     'scammer',
@@ -850,17 +686,19 @@ async function classifyComment(
     'you are scamming',
     'youre scamming',
   ]);
-
-  const harassmentWords = await loadPhraseList(context, 'harassment_phrases', [
-    'are you stupid',
-    'you are stupid',
-    'youre stupid',
-    'you are dumb',
-    'youre dumb',
-    'you must be blind',
-    'touch grass',
-  ]);
-
+  const harassmentWords = await loadPhraseList(
+    context,
+    'harassment_phrases',
+    [
+      'are you stupid',
+      'you are stupid',
+      'youre stupid',
+      'you are dumb',
+      'youre dumb',
+      'you must be blind',
+      'touch grass',
+    ]
+  );
   const policingWords = await loadPhraseList(
     context,
     'value_policing_phrases',
@@ -878,36 +716,41 @@ async function classifyComment(
 
   const flags: FlagType[] = [];
 
-  // ---- Scam accusation detection (with negation/context guard) ----
-  const scamHit = scamWords.some((w) => phraseMatches(textNorm, w, useWordBoundary));
-  const negationEnabled =
-    ((await context.settings.get('enable_scam_negation_guard')) as boolean | undefined) !== false;
+  const scamEnabled =
+    ((await context.settings.get('enable_scam_flags')) as boolean | undefined) !==
+    false;
+  const harassmentEnabled =
+    ((await context.settings.get(
+      'enable_harassment_flags'
+    )) as boolean | undefined) !== false;
+  const policingEnabled =
+    ((await context.settings.get(
+      'enable_policing_flags'
+    )) as boolean | undefined) !== false;
 
-  const scamContextNegation = negationEnabled ? scamNegationOrContext(textNorm) : false;
+  const scamHit = scamEnabled && scamWords.some((w) => text.includes(w));
+  const harassHit =
+    harassmentEnabled && harassmentWords.some((w) => text.includes(w));
+  const policingHit =
+    policingEnabled && policingWords.some((w) => text.includes(w));
 
-  console.log('classifyComment: scamHit =', scamHit, 'negationGuard =', negationEnabled, 'negationMatched =', scamContextNegation);
-
-  if (scamHit && !scamContextNegation) {
-    flags.push('SCAM_ACCUSATION');
-  }
-
-  // ---- Harassment detection ----
-  const harassmentHit = harassmentWords.some((w) =>
-    phraseMatches(textNorm, w, useWordBoundary)
+  console.log('classifyComment: scamWords =', scamWords, 'hit =', scamHit);
+  console.log(
+    'classifyComment: harassmentWords =',
+    harassmentWords,
+    'hit =',
+    harassHit
   );
-  console.log('classifyComment: harassmentHit =', harassmentHit);
-  if (harassmentHit) {
-    flags.push('HARASSMENT');
-  }
-
-  // ---- Value policing detection ----
-  const policingHit = policingWords.some((w) =>
-    phraseMatches(textNorm, w, useWordBoundary)
+  console.log(
+    'classifyComment: policingWords =',
+    policingWords,
+    'hit =',
+    policingHit
   );
-  console.log('classifyComment: policingHit =', policingHit);
-  if (policingHit) {
-    flags.push('VALUE_POLICING');
-  }
+
+  if (scamHit) flags.push('SCAM_ACCUSATION');
+  if (harassHit) flags.push('HARASSMENT');
+  if (policingHit) flags.push('VALUE_POLICING');
 
   console.log('classifyComment: final flags =', flags);
   return flags;
@@ -1004,51 +847,6 @@ async function getUserConduct(
       await kv.put(key, reset);
       await clearUserHistory(context, username);
       return reset;
-    }
-  }
-
-
-  // Optional Stage 5.3: lazy score decay (applied when loading the user)
-  const decayEnabled =
-    ((await context.settings.get('enable_score_decay')) as boolean | undefined) === true;
-
-  if (decayEnabled) {
-    const pointsPerDayRaw = (await context.settings.get(
-      'score_decay_points_per_day'
-    )) as number | undefined;
-    const pointsPerDay =
-      typeof pointsPerDayRaw === 'number' && pointsPerDayRaw > 0
-        ? pointsPerDayRaw
-        : 1;
-
-    const ageMs = Date.now() - new Date(stored.lastUpdated).getTime();
-    const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
-
-    if (days > 0 && (stored.score ?? 0) > 0) {
-      const decay = pointsPerDay * days;
-      const oldScore = stored.score ?? 0;
-      stored.score = Math.max(0, oldScore - decay);
-
-      // If score decayed below the last alert score, allow future alerts again
-      if ((stored as any).lastAlertScore && (stored as any).lastAlertScore > stored.score) {
-        (stored as any).lastAlertScore = 0;
-      }
-
-      stored.lastUpdated = new Date().toISOString();
-      await kv.put(key, stored);
-
-      console.log(
-        'getUserConduct: applied score decay for',
-        username,
-        'days=',
-        days,
-        'pointsPerDay=',
-        pointsPerDay,
-        'oldScore=',
-        oldScore,
-        'newScore=',
-        stored.score
-      );
     }
   }
 
@@ -1302,6 +1100,220 @@ async function isCommandUserAllowed(
   }
 
   return isMod;
+// ---------- Stage 5.4: delayed vote signal (KV job queue) ----------
+
+async function getVoteSignalConfig(context: Devvit.Context): Promise<{
+  enabled: boolean;
+  delayMs: number;
+  scoreThreshold: number;
+  points: number;
+  maxJobsPerRun: number;
+}> {
+  const enabled = (await context.settings.get('vote_signal_enabled')) as
+    | boolean
+    | undefined;
+
+  const delayMinutesRaw = (await context.settings.get(
+    'vote_signal_delay_minutes'
+  )) as number | undefined;
+
+  const scoreThresholdRaw = (await context.settings.get(
+    'vote_signal_score_threshold'
+  )) as number | undefined;
+
+  const pointsRaw = (await context.settings.get('vote_signal_points')) as
+    | number
+    | undefined;
+
+  const maxJobsRaw = (await context.settings.get(
+    'vote_signal_max_jobs_per_run'
+  )) as number | undefined;
+
+  const delayMinutes =
+    typeof delayMinutesRaw === 'number' && isFinite(delayMinutesRaw)
+      ? Math.max(0, delayMinutesRaw)
+      : 60;
+
+  const scoreThreshold =
+    typeof scoreThresholdRaw === 'number' && isFinite(scoreThresholdRaw)
+      ? scoreThresholdRaw
+      : -5;
+
+  const points =
+    typeof pointsRaw === 'number' && isFinite(pointsRaw)
+      ? Math.max(0, Math.floor(pointsRaw))
+      : 1;
+
+  const maxJobsPerRun =
+    typeof maxJobsRaw === 'number' && isFinite(maxJobsRaw)
+      ? Math.max(0, Math.floor(maxJobsRaw))
+      : 3;
+
+  return {
+    enabled: enabled === true,
+    delayMs: delayMinutes * 60_000,
+    scoreThreshold,
+    points,
+    maxJobsPerRun,
+  };
+}
+
+async function enqueueVoteCheckJob(
+  context: Devvit.Context,
+  job: VoteCheckJob
+): Promise<void> {
+  const kv = context.kvStore;
+  if (!kv) return;
+
+  const existing = (await kv.get<VoteCheckJob[]>(VOTE_JOBS_KEY)) ?? [];
+
+  // de-dupe by commentId
+  if (existing.some((j) => j.commentId === job.commentId)) {
+    console.log('Stage5.4: vote job already queued for', job.commentId);
+    return;
+  }
+
+  const updated = [...existing, job];
+
+  // tiny safety cap so the list can’t grow forever if something goes wrong
+  const capped = updated.length > 500 ? updated.slice(updated.length - 500) : updated;
+
+  await kv.put(VOTE_JOBS_KEY, capped);
+  console.log(
+    'Stage5.4: queued vote check job',
+    'commentId=',
+    job.commentId,
+    'user=',
+    job.username,
+    'checkAt=',
+    new Date(job.checkAt).toISOString()
+  );
+}
+
+async function fetchCommentScoreBestEffort(
+  context: Devvit.Context,
+  commentId: string
+): Promise<number | null> {
+  const { reddit } = context;
+
+  // API shape varies across SDK versions; try a couple of safe calls.
+  try {
+    // @ts-expect-error: SDK may expose this helper
+    const c1 = await reddit.getCommentById(commentId);
+    const score = (c1 as any)?.score;
+    if (typeof score === 'number') return score;
+  } catch (e) {
+    // ignore
+  }
+
+  try {
+    // @ts-expect-error: SDK may expose this helper with object arg
+    const c2 = await reddit.getCommentById({ id: commentId });
+    const score = (c2 as any)?.score;
+    if (typeof score === 'number') return score;
+  } catch (e) {
+    // ignore
+  }
+
+  // If we can't fetch, return null (don't crash the pipeline).
+  return null;
+}
+
+async function processDueVoteJobs(
+  context: Devvit.Context
+): Promise<void> {
+  const kv = context.kvStore;
+  if (!kv) return;
+
+  const cfg = await getVoteSignalConfig(context);
+  if (!cfg.enabled) return;
+
+  const jobs = (await kv.get<VoteCheckJob[]>(VOTE_JOBS_KEY)) ?? [];
+  if (jobs.length === 0) return;
+
+  const now = Date.now();
+  const due = jobs.filter((j) => j.checkAt <= now);
+  if (due.length === 0) return;
+
+  const toRun = due.slice(0, cfg.maxJobsPerRun);
+
+  console.log(
+    'Stage5.4: processing vote jobs',
+    'due=',
+    due.length,
+    'running=',
+    toRun.length,
+    'total=',
+    jobs.length
+  );
+
+  const remaining = jobs.filter((j) => !toRun.some((r) => r.commentId === j.commentId));
+
+  for (const job of toRun) {
+    try {
+      const score = await fetchCommentScoreBestEffort(context, job.commentId);
+      console.log('Stage5.4: fetched score', 'commentId=', job.commentId, 'score=', score);
+
+      if (score === null) {
+        console.log('Stage5.4: could not fetch comment score; dropping job', job.commentId);
+        continue;
+      }
+
+      if (score <= cfg.scoreThreshold) {
+        console.log(
+          'Stage5.4: score threshold met',
+          'commentId=',
+          job.commentId,
+          'score=',
+          score,
+          'threshold=',
+          cfg.scoreThreshold,
+          'points=',
+          cfg.points
+        );
+
+        const conduct = await getUserConduct(context, job.username);
+        const oldScore = conduct.score;
+
+        conduct.score = Math.max(0, conduct.score + cfg.points);
+
+        // we also track it in the event log as a separate reason
+        await saveUserConduct(context, job.username, conduct);
+        await addUserToIndex(context, job.username);
+
+        const ev: ConductEvent = {
+          commentId: job.commentId,
+          permalink: job.permalink,
+          flags: job.flags,
+          delta: cfg.points,
+          createdAt: new Date().toISOString(),
+          reason: 'VOTE_SIGNAL',
+        };
+        await addConductEvent(context, job.username, ev);
+
+        console.log(
+          'Stage5.4: applied vote signal points',
+          'user=',
+          job.username,
+          'oldScore=',
+          oldScore,
+          'newScore=',
+          conduct.score
+        );
+      } else {
+        console.log('Stage5.4: score threshold NOT met', 'commentId=', job.commentId);
+      }
+    } catch (err) {
+      console.error('Stage5.4: error processing vote job', job.commentId, err);
+    }
+  }
+
+  // Save remaining jobs
+  await kv.put(VOTE_JOBS_KEY, remaining);
+  console.log('Stage5.4: remaining vote jobs after processing =', remaining.length);
+}
+
+
 }
 
 // ---------- Mod commands ----------
@@ -1841,6 +1853,13 @@ Devvit.addTrigger({
       rawBody
     )
 
+    // Stage5.4: process delayed vote-signal jobs (best-effort)
+    try {
+      await processDueVoteJobs(context);
+    } catch (err) {
+      console.error('Stage5.4: processDueVoteJobs error', err);
+    }
+
     // 🔁 Loop prevention: never process the bot's own comments or its auto-reply marker
     const skipBotComments = true;
     const botUsernameRaw = (await settings.get('bot_username')) as string | undefined;
@@ -1918,30 +1937,11 @@ Devvit.addTrigger({
     const username = await resolveUsername(event, comment);
     console.log('CommentCreate: Username resolution result =', username);
 
-    // Trust context (Stage 5.2)
-    const trust = await getTrustContext(context, event, comment, username);
-
     const nowIso = new Date().toISOString();
 
     // Threshold config
-    const thresholdBase = await getAlertThreshold(context);
-    console.log('CommentCreate: threshold from settings =', thresholdBase);
-
-    let threshold: number | null = thresholdBase;
-    if (thresholdBase != null && trust.isTrusted) {
-      const mult = await getTrustedThresholdMultiplier(context);
-      threshold = Math.ceil(thresholdBase * mult);
-      console.log(
-        'CommentCreate: trusted user, applying threshold multiplier',
-        'base=',
-        thresholdBase,
-        'mult=',
-        mult,
-        'effective=',
-        threshold
-      );
-    }
-
+    const threshold = await getAlertThreshold(context);
+    console.log('CommentCreate: threshold from settings =', threshold);
 
     let thresholdAlertNeeded = false;
     let usernameForAlert: string | undefined;
@@ -2048,6 +2048,38 @@ Devvit.addTrigger({
           postTitle,
         };
         await addConductEvent(context, username, ev);
+        // Stage5.4: enqueue delayed vote-score check (weak signal)
+        try {
+          const cfg = await getVoteSignalConfig(context);
+          if (cfg.enabled && cfg.delayMs > 0 && username) {
+            const commentId = comment.id ?? event.comment?.id ?? '';
+            const postId = comment.postId ?? event.post?.id ?? '';
+            const permalink = `https://reddit.com${comment.permalink}`;
+            if (commentId && postId) {
+              const job: VoteCheckJob = {
+                commentId,
+                username: username.toLowerCase(),
+                postId,
+                permalink,
+                flags,
+                createdAt: nowIso,
+                checkAt: Date.now() + cfg.delayMs,
+              };
+              await enqueueVoteCheckJob(context, job);
+            } else {
+              console.log(
+                'Stage5.4: skipping enqueue (missing ids)',
+                'commentId=',
+                commentId,
+                'postId=',
+                postId
+              );
+            }
+          }
+        } catch (err) {
+          console.error('Stage5.4: failed to enqueue vote job', err);
+        }
+
       } catch (err) {
         console.error('CommentCreate: error during scoring / KV operations', err);
       }
@@ -2232,14 +2264,6 @@ Devvit.addTrigger({
             'auto_reply_on_repeat_offense'
           )) as boolean | undefined) !== false;
 
-        const onFirstEffective = trust.isTrusted ? false : onFirst;
-        if (trust.isTrusted && onFirst) {
-          console.log(
-            'CommentCreate: Stage 5.2 trusted user override: disabling onFirst auto-replies (repeat only).'
-          );
-        }
-
-
         console.log(
           'CommentCreate: Stage 3 offense state',
           'isFirstOffense =',
@@ -2247,32 +2271,16 @@ Devvit.addTrigger({
           'priorRecentCount =',
           priorRecentCount,
           'onFirst =',
-          onFirstEffective,
+          onFirst,
           'onRepeat =',
           onRepeat
         );
 
         let shouldReply = false;
-        if (isFirstOffense && onFirstEffective) {
+        if (isFirstOffense && onFirst) {
           shouldReply = true;
         } else if (!isFirstOffense && onRepeat) {
           shouldReply = true;
-        }
-
-
-        // ---- Stage 4.3 severity tiers: only auto-reply for hard flags unless explicitly enabled ----
-        const includeSoft =
-          ((await settings.get('auto_reply_include_soft_flags')) as boolean | undefined) === true;
-
-        const hasHardFlag = flags.includes('SCAM_ACCUSATION') || flags.includes('HARASSMENT');
-        const hasSoftOnly = !hasHardFlag && flags.includes('VALUE_POLICING');
-
-        if (hasSoftOnly && !includeSoft) {
-          console.log(
-            'CommentCreate: Stage 3 auto-reply skipped (soft flags only and includeSoft=false). flags=',
-            flags
-          );
-          shouldReply = false;
         }
 
         if (!shouldReply) {
