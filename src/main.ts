@@ -128,15 +128,6 @@ Devvit.addSettings([
         defaultValue: '1',
         helpText: 'Integer. Default is 1 point per flagged comment.',
       },
-      {
-        type: 'string',
-        name: 'score_daily_cap',
-        label: 'Daily score cap (optional)',
-        scope: SettingScope.Installation,
-        defaultValue: '',
-        helpText:
-          'Max points a user can gain per day from CommentGuardian scoring. Leave blank or 0 to disable.',
-      },
     ],
   },
 
@@ -240,29 +231,6 @@ Devvit.addSettings([
           'If enabled, the bot will reply to some flagged comments with a gentle reminder.',
       },
       {
-        type: 'boolean',
-        name: 'auto_reply_retry_enabled',
-        label: 'Retry auto-replies on RATELIMIT',
-        scope: SettingScope.Installation,
-        defaultValue: true,
-        helpText:
-          'If enabled, failed auto-replies due to RATELIMIT will be queued and retried automatically.',
-      },
-      {
-        type: 'select',
-        name: 'auto_reply_cooldown_mode',
-        label: 'Auto-reply cooldown mode',
-        scope: SettingScope.Installation,
-        defaultValue: 'per_user_post',
-        options: [
-          { label: 'Global (one cooldown shared across all users/posts)', value: 'global' },
-          { label: 'Per user per post (recommended)', value: 'per_user_post' },
-        ],
-        helpText:
-          'Controls how auto-reply cooldown is tracked. Global helps during bursts; Per user per post avoids one noisy thread stopping reminders elsewhere.',
-      },
-
-      {
         type: 'string',
         name: 'auto_reply_text',
         label: 'Auto-reply text (Markdown)',
@@ -300,6 +268,17 @@ Devvit.addSettings([
       },
       {
         type: 'boolean',
+        name: 'auto_reply_include_soft_flags',
+        label: 'Include soft flags (value policing) in auto-replies',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If disabled (recommended), auto-replies only trigger for hard flags (scam accusations / harassment). Value-policing-only comments will still be reported/scored but will not get an auto-reply.',
+      },
+
+
+      {
+        type: 'boolean',
         name: 'auto_reply_once_per_thread',
         label: 'Only reply once per user per post',
         scope: SettingScope.Installation,
@@ -317,6 +296,89 @@ Devvit.addSettings([
           'Exact Reddit username of the bot account running this Devvit app. Used to avoid the bot replying to itself.',
       },
 
+    ],
+  },
+
+  //
+  // 🔹 Stage 4 — Accuracy
+  //
+  {
+    type: 'group',
+    label: 'Stage 4 — Accuracy',
+    fields: [
+      {
+        type: 'boolean',
+        name: 'enable_word_boundary_matching',
+        label: 'Enable word-boundary matching for single-word phrases',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'Reduces false positives by matching whole words for single-word phrases (e.g., scam, scammer) instead of substring matches.',
+      },
+      {
+        type: 'boolean',
+        name: 'enable_scam_negation_guard',
+        label: 'Enable scam negation/context guard',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, phrases like "not a scam" / "stop calling it a scam" will NOT be flagged as scam accusations.',
+      },
+    ],
+  },
+
+  //
+  // 🔹 Stage 5 — Fairness
+  //
+  {
+    type: 'group',
+    label: 'Stage 5 — Fairness',
+    fields: [
+      {
+        type: 'boolean',
+        name: 'enable_trust_adjustment',
+        label: 'Enable trust adjustment (confirmed-trade flair)',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, users with high confirmed-trade flair are treated as more trusted for auto-replies and threshold alerts (still reported/scored normally).',
+      },
+      {
+        type: 'number',
+        name: 'trusted_trade_count_min',
+        label: 'Trusted trade count minimum',
+        scope: SettingScope.Installation,
+        defaultValue: 20,
+        helpText:
+          'Minimum confirmed-trade count (from user flair text) for a user to be considered trusted.',
+      },
+      {
+        type: 'number',
+        name: 'trusted_alert_threshold_multiplier',
+        label: 'Trusted alert threshold multiplier',
+        scope: SettingScope.Installation,
+        defaultValue: 2,
+        helpText:
+          'When threshold alerts are enabled, trusted users require threshold × this multiplier to trigger mod alerts.',
+      },
+      {
+        type: 'boolean',
+        name: 'enable_score_decay',
+        label: 'Enable score decay (instead of only hard reset)',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, the score will decay over time when a user is loaded (lazy decay). This is optional and can be used alongside score_reset_days.',
+      },
+      {
+        type: 'number',
+        name: 'score_decay_points_per_day',
+        label: 'Score decay points per day',
+        scope: SettingScope.Installation,
+        defaultValue: 1,
+        helpText:
+          'How many points to subtract per day since lastUpdated (floored), when score decay is enabled.',
+      },
     ],
   },
 ]);
@@ -346,6 +408,62 @@ async function loadPhraseList(
 
   console.log('loadPhraseList:', key, 'parsed =', list);
   return list;
+}
+
+
+function normalizeText(input: string): string {
+  // Lowercase, collapse whitespace, and normalize punctuation to spaces
+  return (input ?? '')
+    .toLowerCase()
+    .replace(/[_*`~]/g, ' ') // markdown-ish chars
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[^a-z0-9\s'-]/g, ' ') // keep letters/numbers/space/'/-
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function isWordBoundaryEnabled(context: Devvit.Context): Promise<boolean> {
+  const v = (await context.settings.get('enable_word_boundary_matching')) as
+    | boolean
+    | undefined;
+  return v !== false; // default true
+}
+
+function phraseMatches(textNorm: string, phrase: string, useWordBoundary: boolean): boolean {
+  const p = (phrase ?? '').trim().toLowerCase();
+  if (!p) return false;
+
+  // Multi-word phrase: use includes on normalized text
+  if (p.includes(' ')) {
+    return textNorm.includes(p);
+  }
+
+  if (!useWordBoundary) {
+    return textNorm.includes(p);
+  }
+
+  // Single word: enforce word boundary
+  const re = new RegExp(`\\b${escapeRegex(p)}\\b`, 'i');
+  return re.test(textNorm);
+}
+
+function scamNegationOrContext(textNorm: string): boolean {
+  // If the comment is discouraging scam accusations, don't flag it as a scam accusation.
+  // Keep this intentionally small + high-signal.
+  const patterns: RegExp[] = [
+    /\bnot\s+a\s+scam\b/i,
+    /\bisn'?t\s+a\s+scam\b/i,
+    /\bno\s+scam\b/i,
+    /\bstop\s+calling\b.*\bscam\b/i,
+    /\bdon'?t\s+call\b.*\bscam\b/i,
+    /\bavoid\s+calling\b.*\bscam\b/i,
+    /\bplease\s+don'?t\s+call\b.*\bscam\b/i,
+  ];
+  return patterns.some((re) => re.test(textNorm));
 }
 
 async function getResetWindowMs(
@@ -400,39 +518,6 @@ async function getScoreWeight(
   const value = parseInt(trimmed, 10);
   if (isNaN(value)) return fallback;
   return value;
-}
-
-async function applyDailyScoreCap(
-  context: Devvit.Context,
-  username: string,
-  proposedDelta: number
-): Promise<{ appliedDelta: number; capped: boolean; capValue: number | null }> {
-  const kv = context.kvStore;
-  if (!kv) return { appliedDelta: proposedDelta, capped: false, capValue: null };
-
-  const raw = (await context.settings.get('score_daily_cap')) as string | undefined;
-  const trimmed = (raw ?? '').toString().trim();
-  if (!trimmed) return { appliedDelta: proposedDelta, capped: false, capValue: null };
-
-  const cap = parseInt(trimmed, 10);
-  if (isNaN(cap) || cap <= 0) return { appliedDelta: proposedDelta, capped: false, capValue: null };
-
-  const dayKey = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
-  const key = `daily_points:${username.toLowerCase()}:${dayKey}`;
-
-  const usedRaw = await kv.get<string>(key);
-  const used = usedRaw ? parseInt(usedRaw, 10) : 0;
-  const safeUsed = isNaN(used) || used < 0 ? 0 : used;
-
-  const remaining = Math.max(0, cap - safeUsed);
-  const applied = Math.max(0, Math.min(remaining, proposedDelta));
-  const capped = applied < proposedDelta;
-
-  if (applied > 0) {
-    await kv.put(key, String(safeUsed + applied));
-  }
-
-  return { appliedDelta: applied, capped, capValue: cap };
 }
 
 async function getAlertThreshold(
@@ -523,17 +608,86 @@ async function resolveUsername(
   return undefined;
 }
 
-// ---------- Stage 3 helpers: reply text validation + rate-limit safe retry ----------
 
-const AUTO_REPLY_COOLDOWN_UNTIL_BASE = 'autoreply_cooldown_until';
+function extractFlairTextFromEvent(event: CommentCreate, comment: any): string {
+  const eventAuthor: any = (event as any).author;
 
-function autoReplyCooldownKey(mode: string, usernameLower: string | undefined, postId: string | undefined): string {
-  if (mode === 'per_user_post' && usernameLower && postId) {
-    return `${AUTO_REPLY_COOLDOWN_UNTIL_BASE}:${usernameLower}:${postId}`;
+  const candidates: any[] = [
+    eventAuthor?.flair?.text,
+    eventAuthor?.flairText,
+    eventAuthor?.userFlairText,
+    (comment as any)?.authorFlair?.text,
+    (comment as any)?.authorFlairText,
+    (event as any)?.authorFlair?.text,
+    (event as any)?.authorFlairText,
+  ];
+
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim().length > 0) {
+      return c.trim();
+    }
   }
-  return AUTO_REPLY_COOLDOWN_UNTIL_BASE;
+  return '';
 }
 
+function parseTradeCountFromFlairText(flairText: string): number | null {
+  if (!flairText) return null;
+  const m = flairText.match(/(\d{1,6})/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function getTrustContext(
+  context: Devvit.Context,
+  event: CommentCreate,
+  comment: any,
+  username?: string
+): Promise<{ isTrusted: boolean; tradeCount: number | null; flairText: string }> {
+  const enabled =
+    ((await context.settings.get('enable_trust_adjustment')) as boolean | undefined) !== false;
+
+  const flairText = extractFlairTextFromEvent(event, comment);
+  const tradeCount = parseTradeCountFromFlairText(flairText);
+
+  const minTrustedRaw = (await context.settings.get(
+    'trusted_trade_count_min'
+  )) as number | undefined;
+  const minTrusted = typeof minTrustedRaw === 'number' && minTrustedRaw > 0 ? minTrustedRaw : 20;
+
+  const isTrusted = enabled && tradeCount != null && tradeCount >= minTrusted;
+
+  console.log(
+    'trustContext:',
+    'enabled=',
+    enabled,
+    'user=',
+    username,
+    'flairText=',
+    flairText,
+    'tradeCount=',
+    tradeCount,
+    'minTrusted=',
+    minTrusted,
+    'isTrusted=',
+    isTrusted
+  );
+
+  return { isTrusted, tradeCount, flairText };
+}
+
+async function getTrustedThresholdMultiplier(context: Devvit.Context): Promise<number> {
+  const raw = (await context.settings.get(
+    'trusted_alert_threshold_multiplier'
+  )) as number | undefined;
+  if (typeof raw === 'number' && raw >= 1) return raw;
+  return 2;
+}
+
+
+// ---------- Stage 3 helpers: reply text validation + rate-limit safe retry ----------
+
+const AUTO_REPLY_COOLDOWN_UNTIL_KEY = 'autoreply_cooldown_until';
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -587,12 +741,11 @@ function buildAutoReplyBody(
 }
 
 async function getAutoReplyCooldownUntilMs(
-  context: Devvit.Context,
-  key: string
+  context: Devvit.Context
 ): Promise<number> {
   const kv = context.kvStore;
   if (!kv) return 0;
-  const v = await kv.get<string>(key);
+  const v = await kv.get<string>(AUTO_REPLY_COOLDOWN_UNTIL_KEY);
   if (!v) return 0;
   const n = parseInt(v, 10);
   if (isNaN(n) || n <= 0) return 0;
@@ -601,14 +754,13 @@ async function getAutoReplyCooldownUntilMs(
 
 async function setAutoReplyCooldownSeconds(
   context: Devvit.Context,
-  key: string,
   seconds: number
 ): Promise<void> {
   const kv = context.kvStore;
   if (!kv) return;
   const s = Math.max(1, Math.min(3600, seconds)); // cap at 1h
   const until = Date.now() + s * 1000;
-  await kv.put(key, String(until));
+  await kv.put(AUTO_REPLY_COOLDOWN_UNTIL_KEY, String(until));
   console.log(
     'Stage3: global auto-reply cooldown set for',
     s,
@@ -621,8 +773,7 @@ async function submitAutoReplyWithRetry(
   context: Devvit.Context,
   parentCommentId: string,
   replyBody: string,
-  usernameForLogs: string,
-  cooldownKey: string
+  usernameForLogs: string
 ): Promise<void> {
   // IMPORTANT: Avoid using Comment.reply(string) because we’ve seen NO_TEXT even with non-empty strings.
   // Using submitComment with explicit {text} prevents the "NO_TEXT" gRPC error.
@@ -665,11 +816,7 @@ async function submitAutoReplyWithRetry(
       if (isRateLimitError(err)) {
         const sec = parseRateLimitSeconds(err) ?? 5;
         // Set a global cooldown so we don’t hammer replies during bursts.
-        await setAutoReplyCooldownSeconds(context, cooldownKey, sec + 1);
-        // Also set a global cooldown to respect account-wide limits.
-        if (cooldownKey !== AUTO_REPLY_COOLDOWN_UNTIL_BASE) {
-          await setAutoReplyCooldownSeconds(context, AUTO_REPLY_COOLDOWN_UNTIL_BASE, sec + 1);
-        }
+        await setAutoReplyCooldownSeconds(context, sec + 1);
 
         if (attempt < maxAttempts) {
           const waitSec = Math.min(10, sec + 1);
@@ -685,47 +832,16 @@ async function submitAutoReplyWithRetry(
   }
 }
 
-// ---------- Matching helpers (no-ML quality improvements) ----------
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function phraseHit(textLower: string, phraseLower: string): boolean {
-  const p = (phraseLower ?? '').trim().toLowerCase();
-  if (!p) return false;
-
-  // If the phrase has whitespace or punctuation, substring match is safest.
-  if (/[^a-z0-9]/i.test(p)) {
-    return textLower.includes(p);
-  }
-
-  // Single token: word boundary match to avoid partial matches.
-  try {
-    const r = new RegExp(`\\b${escapeRegExp(p)}\\b`, 'i');
-    return r.test(textLower);
-  } catch {
-    return textLower.includes(p);
-  }
-}
-
-function phraseListHit(textLower: string, phrases: string[]): boolean {
-  return phrases.some((p) => phraseHit(textLower, p));
-}
-
-function isLikelyScamNegation(textLower: string): boolean {
-  return /\b(not|isn'?t|is\s+not|ain'?t)\s+(a\s+)?scam(ming|mer)?\b/i.test(textLower);
-}
-
 // ---------- Classifier (Stage 1) ----------
-
 
 async function classifyComment(
   body: string,
   context: Devvit.Context
 ): Promise<FlagType[]> {
-  const text = body.toLowerCase();
   console.log('classifyComment: body =', body);
+
+  const textNorm = normalizeText(body);
+  const useWordBoundary = await isWordBoundaryEnabled(context);
 
   const scamWords = await loadPhraseList(context, 'scam_phrases', [
     'scammer',
@@ -734,19 +850,17 @@ async function classifyComment(
     'you are scamming',
     'youre scamming',
   ]);
-  const harassmentWords = await loadPhraseList(
-    context,
-    'harassment_phrases',
-    [
-      'are you stupid',
-      'you are stupid',
-      'youre stupid',
-      'you are dumb',
-      'youre dumb',
-      'you must be blind',
-      'touch grass',
-    ]
-  );
+
+  const harassmentWords = await loadPhraseList(context, 'harassment_phrases', [
+    'are you stupid',
+    'you are stupid',
+    'youre stupid',
+    'you are dumb',
+    'youre dumb',
+    'you must be blind',
+    'touch grass',
+  ]);
+
   const policingWords = await loadPhraseList(
     context,
     'value_policing_phrases',
@@ -764,41 +878,36 @@ async function classifyComment(
 
   const flags: FlagType[] = [];
 
-  const scamEnabled =
-    ((await context.settings.get('enable_scam_flags')) as boolean | undefined) !==
-    false;
-  const harassmentEnabled =
-    ((await context.settings.get(
-      'enable_harassment_flags'
-    )) as boolean | undefined) !== false;
-  const policingEnabled =
-    ((await context.settings.get(
-      'enable_policing_flags'
-    )) as boolean | undefined) !== false;
+  // ---- Scam accusation detection (with negation/context guard) ----
+  const scamHit = scamWords.some((w) => phraseMatches(textNorm, w, useWordBoundary));
+  const negationEnabled =
+    ((await context.settings.get('enable_scam_negation_guard')) as boolean | undefined) !== false;
 
-  const scamHit = scamEnabled && scamWords.some((w) => text.includes(w));
-  const harassHit =
-    harassmentEnabled && harassmentWords.some((w) => text.includes(w));
-  const policingHit =
-    policingEnabled && policingWords.some((w) => text.includes(w));
+  const scamContextNegation = negationEnabled ? scamNegationOrContext(textNorm) : false;
 
-  console.log('classifyComment: scamWords =', scamWords, 'hit =', scamHit);
-  console.log(
-    'classifyComment: harassmentWords =',
-    harassmentWords,
-    'hit =',
-    harassHit
+  console.log('classifyComment: scamHit =', scamHit, 'negationGuard =', negationEnabled, 'negationMatched =', scamContextNegation);
+
+  if (scamHit && !scamContextNegation) {
+    flags.push('SCAM_ACCUSATION');
+  }
+
+  // ---- Harassment detection ----
+  const harassmentHit = harassmentWords.some((w) =>
+    phraseMatches(textNorm, w, useWordBoundary)
   );
-  console.log(
-    'classifyComment: policingWords =',
-    policingWords,
-    'hit =',
-    policingHit
-  );
+  console.log('classifyComment: harassmentHit =', harassmentHit);
+  if (harassmentHit) {
+    flags.push('HARASSMENT');
+  }
 
-  if (scamHit) flags.push('SCAM_ACCUSATION');
-  if (harassHit) flags.push('HARASSMENT');
-  if (policingHit) flags.push('VALUE_POLICING');
+  // ---- Value policing detection ----
+  const policingHit = policingWords.some((w) =>
+    phraseMatches(textNorm, w, useWordBoundary)
+  );
+  console.log('classifyComment: policingHit =', policingHit);
+  if (policingHit) {
+    flags.push('VALUE_POLICING');
+  }
 
   console.log('classifyComment: final flags =', flags);
   return flags;
@@ -895,6 +1004,51 @@ async function getUserConduct(
       await kv.put(key, reset);
       await clearUserHistory(context, username);
       return reset;
+    }
+  }
+
+
+  // Optional Stage 5.3: lazy score decay (applied when loading the user)
+  const decayEnabled =
+    ((await context.settings.get('enable_score_decay')) as boolean | undefined) === true;
+
+  if (decayEnabled) {
+    const pointsPerDayRaw = (await context.settings.get(
+      'score_decay_points_per_day'
+    )) as number | undefined;
+    const pointsPerDay =
+      typeof pointsPerDayRaw === 'number' && pointsPerDayRaw > 0
+        ? pointsPerDayRaw
+        : 1;
+
+    const ageMs = Date.now() - new Date(stored.lastUpdated).getTime();
+    const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+
+    if (days > 0 && (stored.score ?? 0) > 0) {
+      const decay = pointsPerDay * days;
+      const oldScore = stored.score ?? 0;
+      stored.score = Math.max(0, oldScore - decay);
+
+      // If score decayed below the last alert score, allow future alerts again
+      if ((stored as any).lastAlertScore && (stored as any).lastAlertScore > stored.score) {
+        (stored as any).lastAlertScore = 0;
+      }
+
+      stored.lastUpdated = new Date().toISOString();
+      await kv.put(key, stored);
+
+      console.log(
+        'getUserConduct: applied score decay for',
+        username,
+        'days=',
+        days,
+        'pointsPerDay=',
+        pointsPerDay,
+        'oldScore=',
+        oldScore,
+        'newScore=',
+        stored.score
+      );
     }
   }
 
@@ -1764,11 +1918,30 @@ Devvit.addTrigger({
     const username = await resolveUsername(event, comment);
     console.log('CommentCreate: Username resolution result =', username);
 
+    // Trust context (Stage 5.2)
+    const trust = await getTrustContext(context, event, comment, username);
+
     const nowIso = new Date().toISOString();
 
     // Threshold config
-    const threshold = await getAlertThreshold(context);
-    console.log('CommentCreate: threshold from settings =', threshold);
+    const thresholdBase = await getAlertThreshold(context);
+    console.log('CommentCreate: threshold from settings =', thresholdBase);
+
+    let threshold: number | null = thresholdBase;
+    if (thresholdBase != null && trust.isTrusted) {
+      const mult = await getTrustedThresholdMultiplier(context);
+      threshold = Math.ceil(thresholdBase * mult);
+      console.log(
+        'CommentCreate: trusted user, applying threshold multiplier',
+        'base=',
+        thresholdBase,
+        'mult=',
+        mult,
+        'effective=',
+        threshold
+      );
+    }
+
 
     let thresholdAlertNeeded = false;
     let usernameForAlert: string | undefined;
@@ -1810,22 +1983,6 @@ Devvit.addTrigger({
           conduct.valueFlags += 1;
           delta += policingWeight;
         }
-
-        // Optional fairness guard: cap how many points a user can gain per day
-        const capResult = await applyDailyScoreCap(context, username, delta);
-        if (capResult.capped) {
-          console.log(
-            'CommentCreate: daily cap applied for',
-            username,
-            'cap=',
-            capResult.capValue,
-            'requestedDelta=',
-            delta,
-            'appliedDelta=',
-            capResult.appliedDelta
-          );
-        }
-        delta = capResult.appliedDelta;
 
         conduct.score = (conduct.score ?? 0) + delta;
 
@@ -2027,31 +2184,11 @@ Devvit.addTrigger({
           username
         );
 
-        // Auto-reply cooldown (configurable: global vs per user per post)
-        const cooldownModeRaw = await settings.get('auto_reply_cooldown_mode');
-        let cooldownModeStr = 'per_user_post';
-        if (typeof cooldownModeRaw === 'string') {
-          cooldownModeStr = cooldownModeRaw;
-        } else if (
-          cooldownModeRaw &&
-          typeof cooldownModeRaw === 'object' &&
-          'value' in (cooldownModeRaw as any) &&
-          typeof (cooldownModeRaw as any).value === 'string'
-        ) {
-          // Some Devvit settings UIs may return { value, label }
-          cooldownModeStr = (cooldownModeRaw as any).value;
-        } else if (cooldownModeRaw != null) {
-          cooldownModeStr = String(cooldownModeRaw);
-        }
-        const cooldownMode = cooldownModeStr.trim().toLowerCase();
-        const usernameLower = username.toLowerCase();
-        const postIdForCooldown = post?.id ?? comment.postId ?? event.comment?.postId;
-        const cooldownKey = autoReplyCooldownKey(cooldownMode, usernameLower, postIdForCooldown);
-
-        const cooldownUntil = await getAutoReplyCooldownUntilMs(context, cooldownKey);
+        // Global cooldown (protects against RATELIMIT bursts)
+        const cooldownUntil = await getAutoReplyCooldownUntilMs(context);
         if (cooldownUntil > Date.now()) {
           console.log(
-            'CommentCreate: Stage 3 auto-reply skipped due to cooldown. cooldownUntilMs =',
+            'CommentCreate: Stage 3 auto-reply skipped due to global cooldown. cooldownUntilMs =',
             cooldownUntil
           );
           console.log('CommentCreate: END (normal path)');
@@ -2095,6 +2232,14 @@ Devvit.addTrigger({
             'auto_reply_on_repeat_offense'
           )) as boolean | undefined) !== false;
 
+        const onFirstEffective = trust.isTrusted ? false : onFirst;
+        if (trust.isTrusted && onFirst) {
+          console.log(
+            'CommentCreate: Stage 5.2 trusted user override: disabling onFirst auto-replies (repeat only).'
+          );
+        }
+
+
         console.log(
           'CommentCreate: Stage 3 offense state',
           'isFirstOffense =',
@@ -2102,16 +2247,32 @@ Devvit.addTrigger({
           'priorRecentCount =',
           priorRecentCount,
           'onFirst =',
-          onFirst,
+          onFirstEffective,
           'onRepeat =',
           onRepeat
         );
 
         let shouldReply = false;
-        if (isFirstOffense && onFirst) {
+        if (isFirstOffense && onFirstEffective) {
           shouldReply = true;
         } else if (!isFirstOffense && onRepeat) {
           shouldReply = true;
+        }
+
+
+        // ---- Stage 4.3 severity tiers: only auto-reply for hard flags unless explicitly enabled ----
+        const includeSoft =
+          ((await settings.get('auto_reply_include_soft_flags')) as boolean | undefined) === true;
+
+        const hasHardFlag = flags.includes('SCAM_ACCUSATION') || flags.includes('HARASSMENT');
+        const hasSoftOnly = !hasHardFlag && flags.includes('VALUE_POLICING');
+
+        if (hasSoftOnly && !includeSoft) {
+          console.log(
+            'CommentCreate: Stage 3 auto-reply skipped (soft flags only and includeSoft=false). flags=',
+            flags
+          );
+          shouldReply = false;
         }
 
         if (!shouldReply) {
@@ -2186,8 +2347,7 @@ Devvit.addTrigger({
                   context,
                   comment.id,
                   replyBody,
-                  username,
-                  cooldownKey
+                  username
                 );
               } catch (err) {
                 console.error('Stage3: error posting auto-reply', err);
