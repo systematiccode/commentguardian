@@ -35,6 +35,16 @@ interface VoteCheckJob {
 const CONDUCT_USERS_KEY = 'conduct_users';
 const VOTE_JOBS_KEY = 'vote_jobs';
 
+// Simple in-memory cache for mod checks to avoid hitting the API on every comment
+// Key: `${subredditName.toLowerCase()}:${username.toLowerCase()}`
+const MOD_CACHE = new Map<
+  string,
+  {
+    isMod: boolean;
+    expiresAt: number;
+  }
+>();
+
 
 function conductKeyForUser(username: string): string {
   return `conduct:${username.toLowerCase()}`;
@@ -187,8 +197,116 @@ Devvit.addSettings([
         helpText:
           'If enabled, the bot will remove mod command comments like !cg-top, !cg-user, etc. after processing.',
       },
+
+      // 🔹 Optional: Remove comments based on user trade-count flair
+      // NOTE: Moved into its own top-level Settings group: "Flair Gate"
+      ...(false
+        ? [
+          {
+            type: 'boolean',
+            name: 'trade_flair_gate_enabled',
+            label: 'Enable trade-count flair gate (auto-remove low-trade comments)',
+            scope: SettingScope.Installation,
+            defaultValue: false,
+            helpText:
+              'If enabled, the bot will parse the user\'s trade-count from their user flair (e.g., "84 Trades | Veteran Trader") and auto-remove comments below a configured minimum.',
+          },
+          {
+            type: 'string',
+            name: 'trade_flair_gate_min_trades',
+            label: 'Minimum trades required (auto-remove if below)',
+            scope: SettingScope.Installation,
+            defaultValue: '0',
+            helpText:
+              'Integer. Example: set to 1 to remove users with 0 Trades. Set to 5 to require at least 5 Trades.',
+          },
+          {
+            type: 'string',
+            name: 'trade_flair_gate_regex',
+            label: 'Regex to parse trade-count from USER flair',
+            scope: SettingScope.Installation,
+            defaultValue: '^(\\d+)\\s*Trades?\\b',
+            helpText:
+              'Regex with a capture group for the trade-count. Example default matches "0 Trades" or "84 Trade" at the start of the flair.',
+          },
+          {
+            type: 'boolean',
+            name: 'trade_flair_gate_missing_as_zero',
+            label: 'Treat missing/unparseable flair as 0 Trades',
+            scope: SettingScope.Installation,
+            defaultValue: true,
+            helpText:
+              'If enabled and the user has no flair (or it does not match the regex), the bot will treat them as having 0 Trades for gating.',
+          },
+          {
+            type: 'boolean',
+            name: 'trade_flair_gate_exempt_mods',
+            label: 'Exempt moderators from trade-count flair gate',
+            scope: SettingScope.Installation,
+            defaultValue: true,
+            helpText:
+              'If enabled, moderators will not be affected by the trade-count flair gate.',
+          },
+        ]
+        : []),
+
     ],
   },
+  //
+  // 🔹 Flair Gate
+  //
+  {
+    type: 'group',
+    label: 'Flair Gate',
+    fields: [
+      {
+        type: 'boolean',
+        name: 'trade_flair_gate_enabled',
+        label: 'Enable trade-count flair gate (auto-remove low-trade comments)',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, the bot will parse the user\'s trade-count from their user flair (e.g., "84 Trades | Veteran Trader") and auto-remove comments below a configured minimum.',
+      },
+      {
+        type: 'string',
+        name: 'trade_flair_gate_min_trades',
+        label: 'Minimum trades required (auto-remove if below)',
+        scope: SettingScope.Installation,
+        defaultValue: '0',
+        helpText:
+          'Integer. Example: set to 1 to remove users with 0 Trades. Set to 5 to require at least 5 Trades.',
+      },
+      {
+        type: 'string',
+        name: 'trade_flair_gate_regex',
+        label: 'Regex to parse trade-count from USER flair',
+        scope: SettingScope.Installation,
+        defaultValue: '^(\\d+)\\s*Trades?\\b',
+        helpText:
+          'Regex with a capture group for the trade-count. Example default matches "0 Trades" or "84 Trade" at the start of the flair.',
+      },
+      {
+        type: 'boolean',
+        name: 'trade_flair_gate_missing_as_zero',
+        label: 'Treat missing/unparseable flair as 0 Trades',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled and the user has no flair (or it does not match the regex), the bot will treat them as having 0 Trades for gating.',
+      },
+      {
+        type: 'boolean',
+        name: 'trade_flair_gate_exempt_mods',
+        label: 'Exempt moderators from trade-count flair gate',
+        scope: SettingScope.Installation,
+        defaultValue: true,
+        helpText:
+          'If enabled, moderators will not be affected by the trade-count flair gate.',
+      },
+    ],
+  },
+
 
   //
   // 🔹 Score Reset & Threshold Alerts
@@ -1291,6 +1409,183 @@ async function isCommandUserAllowed(
   return isMod;
 }
 
+// ---------- Trade-count flair gate helpers ----------
+
+function safeParseInt(raw: unknown, fallback: number): number {
+  const n = typeof raw === 'number' ? raw : parseInt(String(raw ?? ''), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function getAuthorFlairTextBestEffort(event: CommentCreate): string {
+  // Devvit event/comment shapes can vary. Use a best-effort approach with multiple fallbacks.
+  const commentAny = (event as any).comment as any;
+  const authorAny = (event as any).author as any;
+
+  const candidates: unknown[] = [
+    commentAny?.authorFlairText,
+    commentAny?.author_flair_text,
+    commentAny?.authorFlair?.text,
+    authorAny?.flairText,
+    authorAny?.flair_text,
+    authorAny?.flair?.text,
+    authorAny?.subredditFlairText,
+  ];
+
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim().length > 0) return c.trim();
+  }
+  return '';
+}
+
+function parseTradeCountFromFlairText(
+  flairText: string,
+  regexSource: string
+): number | null {
+  const text = (flairText ?? '').trim();
+  if (!text) return null;
+
+  let re: RegExp;
+  try {
+    re = new RegExp(regexSource, 'i');
+  } catch {
+    // If the regex is invalid, fall back to a safe default.
+    re = /^(\d+)\s*Trades?\b/i;
+  }
+
+  const m = text.match(re);
+  if (!m) return null;
+  const num = safeParseInt(m[1], NaN);
+  return Number.isFinite(num) ? num : null;
+}
+
+async function isModeratorFast(
+  context: Devvit.Context,
+  subredditName: string,
+  username: string
+): Promise<boolean> {
+  const key = `${subredditName.toLowerCase()}:${username.toLowerCase()}`;
+  const now = Date.now();
+  const cached = MOD_CACHE.get(key);
+  if (cached && cached.expiresAt > now) return cached.isMod;
+
+  let isMod = false;
+  try {
+    const mods = await context.reddit
+      .getModerators({ subredditName, username })
+      .all();
+    isMod = mods.length > 0;
+  } catch (error) {
+    console.error('isModeratorFast: error checking moderators:', error);
+  }
+
+  // Cache for 5 minutes
+  MOD_CACHE.set(key, { isMod, expiresAt: now + 5 * 60 * 1000 });
+  return isMod;
+}
+
+async function applyTradeFlairGateIfNeeded(
+  event: CommentCreate,
+  context: Devvit.Context
+): Promise<{ removed: boolean; reason?: string }>{
+  const { settings, reddit } = context;
+  const enabled = (await settings.get('trade_flair_gate_enabled')) as
+    | boolean
+    | undefined;
+
+  if (enabled !== true) return { removed: false };
+
+  const subredditName = event.subreddit?.name ?? '';
+  const username = (event.author?.name ?? '').trim();
+  if (!subredditName || !username) return { removed: false };
+
+  const exemptMods = (await settings.get('trade_flair_gate_exempt_mods')) as
+    | boolean
+    | undefined;
+
+  if (exemptMods !== false) {
+    const isMod = await isModeratorFast(context, subredditName, username);
+    if (isMod) {
+      console.log(
+        'tradeFlairGate: user is moderator, exempting',
+        'username =',
+        username
+      );
+      return { removed: false };
+    }
+  }
+
+  const minTradesRaw = (await settings.get('trade_flair_gate_min_trades')) as
+    | string
+    | undefined;
+  const minTrades = safeParseInt(minTradesRaw, 0);
+
+  const regexSource =
+    ((await settings.get('trade_flair_gate_regex')) as string | undefined) ??
+    '^(\\d+)\\s*Trades?\\b';
+
+  const missingAsZero = (await settings.get(
+    'trade_flair_gate_missing_as_zero'
+  )) as boolean | undefined;
+
+  const flairText = getAuthorFlairTextBestEffort(event);
+  const parsed = parseTradeCountFromFlairText(flairText, regexSource);
+  const trades =
+    parsed != null ? parsed : missingAsZero !== false ? 0 : null;
+
+  console.log(
+    'tradeFlairGate: check',
+    'username =',
+    username,
+    'flairText =',
+    flairText,
+    'parsedTrades =',
+    parsed,
+    'effectiveTrades =',
+    trades,
+    'minTrades =',
+    minTrades
+  );
+
+  if (trades == null) {
+    console.log(
+      'tradeFlairGate: could not parse trades and missing_as_zero=false; skipping'
+    );
+    return { removed: false };
+  }
+
+  if (trades < minTrades) {
+    try {
+      const apiComment = await reddit.getCommentById(event.comment?.id ?? '');
+      if (typeof (apiComment as any).remove === 'function') {
+        await (apiComment as any).remove();
+        console.log(
+          'tradeFlairGate: removed comment due to low trade-count',
+          'commentId =',
+          event.comment?.id,
+          'username =',
+          username,
+          'trades =',
+          trades,
+          'minTrades =',
+          minTrades
+        );
+        return {
+          removed: true,
+          reason: `User flair trade-count gate: ${trades} < ${minTrades}`,
+        };
+      } else {
+        console.log(
+          'tradeFlairGate: apiComment.remove is not a function; cannot remove'
+        );
+      }
+    } catch (err) {
+      console.error('tradeFlairGate: error while removing comment', err);
+    }
+  }
+
+  return { removed: false };
+}
+
 // ---------- Stage 5.4: delayed vote signal (KV job queue) ----------
 
 async function getVoteSignalConfig(context: Devvit.Context): Promise<{
@@ -2073,6 +2368,18 @@ Devvit.addTrigger({
       await handleModCommand(event, context);
       console.log('CommentCreate: END (command path)');
       return;
+    }
+
+    // 0.5) Optional: trade-count flair gate (auto-remove low-trade comments)
+    try {
+      const gate = await applyTradeFlairGateIfNeeded(event, context);
+      if (gate.removed) {
+        console.log('CommentCreate: trade flair gate removed comment', gate.reason);
+        console.log('CommentCreate: END (trade flair gate)');
+        return;
+      }
+    } catch (err) {
+      console.error('CommentCreate: trade flair gate error', err);
     }
 
     // 1) Flair filter (optional)
