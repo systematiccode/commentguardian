@@ -352,6 +352,92 @@ Devvit.addSettings([
 
     ],
   },
+
+  // ---------- Behavior Guards (simple) ----------
+  {
+    type: 'group',
+    label: 'Behavior Guards',
+    fields: [
+      {
+        type: 'boolean',
+        name: 'enable_value_once_per_post',
+        label: 'Value policing: allow only 1 per user per post',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, once a user has made one value-policing comment on a post, subsequent value-policing comments by that same user on that same post will be actioned.',
+      },
+      {
+        type: 'select',
+        name: 'value_once_action',
+        label: 'Value policing follow-up action',
+        scope: SettingScope.Installation,
+        defaultValue: 'reply',
+        options: [
+          { label: 'Reply (bot comment)', value: 'reply' },
+          { label: 'Remove (mod action)', value: 'remove' },
+        ],
+        helpText:
+          'What to do when a user posts more than one value-policing comment on the same post.',
+      },
+      {
+        type: 'string',
+        name: 'value_once_reply_template',
+        label: 'Value policing reply template',
+        scope: SettingScope.Installation,
+        defaultValue:
+          'Hi u/{username} — please keep value feedback to **one comment per post**. If you have more to add, edit your original comment.',
+        helpText:
+          'Template used when action is Reply. Supports {username} and {subreddit}.',
+      },
+
+      {
+        type: 'boolean',
+        name: 'enable_dogpile_guard',
+        label: 'Argument / dogpile guard (too many comments on same post)',
+        scope: SettingScope.Installation,
+        defaultValue: false,
+        helpText:
+          'If enabled, the app will track how many comments a user leaves on the same post within a time window. Once they exceed the max, subsequent comments can be replied-to or removed.',
+      },
+      {
+        type: 'number',
+        name: 'dogpile_max_comments',
+        label: 'Max comments per user per post (within window)',
+        scope: SettingScope.Installation,
+        defaultValue: 6,
+      },
+      {
+        type: 'number',
+        name: 'dogpile_window_minutes',
+        label: 'Dogpile window (minutes)',
+        scope: SettingScope.Installation,
+        defaultValue: 30,
+      },
+      {
+        type: 'select',
+        name: 'dogpile_action',
+        label: 'Dogpile follow-up action',
+        scope: SettingScope.Installation,
+        defaultValue: 'reply',
+        options: [
+          { label: 'Reply (bot comment)', value: 'reply' },
+          { label: 'Remove (mod action)', value: 'remove' },
+        ],
+      },
+      {
+        type: 'string',
+        name: 'dogpile_reply_template',
+        label: 'Dogpile reply template',
+        scope: SettingScope.Installation,
+        defaultValue:
+          'Hi u/{username} — it looks like this thread is getting heated. Please avoid back-and-forth arguments. If needed, report and move on.',
+        helpText:
+          'Template used when action is Reply. Supports {username} and {subreddit}.',
+      },
+    ],
+  },
+
 ]);
 
 
@@ -523,6 +609,27 @@ async function resolveUsername(
   return undefined;
 }
 
+// ---------- Settings helpers ----------
+// Devvit `select` settings may come back as a string OR an object (e.g. { label, value }).
+// Normalize to a lowercase string so comparisons like "remove" work reliably.
+function normalizeSelectSetting(raw: any, fallback: string): string {
+  try {
+    if (raw === null || raw === undefined) return fallback;
+    if (typeof raw === 'string') return raw.trim().toLowerCase();
+    if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw).trim().toLowerCase();
+    if (typeof raw === 'object') {
+      const anyRaw: any = raw;
+      if (typeof anyRaw.value === 'string') return anyRaw.value.trim().toLowerCase();
+      if (typeof anyRaw.selected === 'string') return anyRaw.selected.trim().toLowerCase();
+      if (typeof anyRaw.name === 'string') return anyRaw.name.trim().toLowerCase();
+    }
+    return String(raw).trim().toLowerCase();
+  } catch {
+    return fallback;
+  }
+}
+
+
 // ---------- Stage 3 helpers: reply text validation + rate-limit safe retry ----------
 
 const AUTO_REPLY_COOLDOWN_UNTIL_KEY = 'autoreply_cooldown_until';
@@ -669,6 +776,88 @@ async function submitAutoReplyWithRetry(
     }
   }
 }
+// ---------- Behavior Guard helpers (Stage 6.x) ----------
+
+function renderTemplate(template: string, vars: Record<string, string>): string {
+  let out = template ?? '';
+  for (const [k, v] of Object.entries(vars)) {
+    out = out.split(`{${k}}`).join(v);
+  }
+  return out;
+}
+
+async function tryRemoveComment(context: Devvit.Context, commentId: string): Promise<boolean> {
+  try {
+    // Fetch API comment to ensure we have a model instance with moderation methods.
+    const apiComment = await context.reddit.getCommentById(commentId);
+    // remove() exists on API model comments.
+    await apiComment.remove();
+    return true;
+  } catch (err) {
+    console.error('Stage6: failed to remove comment', commentId, err);
+    return false;
+  }
+}
+
+/**
+ * Ensures we only ever action "subsequent" comments:
+ * - value-once uses a simple marker per user per post (first value-policing comment sets it)
+ * - dogpile tracks a rolling count of timestamps per user per post
+ */
+function valueOnceKey(postId: string, username: string): string {
+  return `valueOnce:${postId}:${username.toLowerCase()}`;
+}
+function dogpileKey(postId: string, username: string): string {
+  return `dogpile:${postId}:${username.toLowerCase()}`;
+}
+
+async function getJsonKV<T>(context: Devvit.Context, key: string, fallback: T): Promise<T> {
+  // IMPORTANT: Use the same persistent KV store as the rest of the app.
+  // Some Devvit runtimes return either a string OR an object wrapper (e.g. { value: "..." }).
+  const kvStore = (context as any).kvStore ?? (context as any).kv;
+  if (!kvStore) return fallback;
+
+  let raw: any;
+  try {
+    raw = await kvStore.get(key);
+  } catch {
+    return fallback;
+  }
+  if (raw === undefined || raw === null) return fallback;
+
+  // Unwrap common shapes
+  if (typeof raw === 'object') {
+    if ('value' in raw) raw = (raw as any).value;
+    else if ('data' in raw && typeof (raw as any).data === 'string') raw = (raw as any).data;
+  }
+
+  if (raw === undefined || raw === null) return fallback;
+
+  // Devvit KV is usually string-based; we store JSON.
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) return fallback;
+    try {
+      return JSON.parse(trimmed) as T;
+    } catch {
+      return (raw as unknown) as T;
+    }
+  }
+
+  // If already-parsed (rare), return as-is.
+  return raw as T;
+}
+async function setJsonKV<T>(context: Devvit.Context, key: string, value: T): Promise<void> {
+  const kvStore = (context as any).kvStore ?? (context as any).kv;
+  if (!kvStore) return;
+  // Store JSON so reads are stable across environments.
+  try {
+    await kvStore.put(key, JSON.stringify(value));
+  } catch (e) {
+    console.log('Stage6: setJsonKV failed for key=', key, 'err=', e);
+  }
+}
+
 
 // ---------- Classifier (Stage 1) ----------
 
@@ -2201,8 +2390,136 @@ Devvit.addTrigger({
     }
 
     // ================
-    // STAGE 3 – Auto reply logic
-    // ================
+    // 
+    // ---------- STAGE 6.x: Simple behavior guards (optional) ----------
+    // These are intentionally minimal: a single toggle + action (reply/remove).
+
+    const enableValueOnce = (await settings.get('enable_value_once_per_post')) as boolean | undefined;
+    const enableDogpile = (await settings.get('enable_dogpile_guard')) as boolean | undefined;
+
+    const postIdForGuards = comment.postId ?? post?.id;
+    const usernameForGuards = username; // resolved earlier (string)
+
+    if ((enableValueOnce || enableDogpile) && postIdForGuards && usernameForGuards) {
+      // Shared mini-cooldown to reduce accidental RATELIMIT bursts for guard actions.
+      const nowIso = new Date().toISOString();
+      const nowMs = Date.now();
+
+      // 6.1 Value policing: only one per user per post
+      if (enableValueOnce === true && flags.includes('VALUE_POLICING')) {
+        const key = valueOnceKey(postIdForGuards, usernameForGuards);
+        const existing = await getJsonKV<string | null>(context, key, null);
+
+        console.log('Stage6.1: value-once check', 'key=', key, 'existing=', !!existing);
+
+        if (!existing) {
+          // First value-policing comment in this post for this user: mark and continue.
+          await setJsonKV(context, key, nowIso);
+          console.log('Stage6.1: marked first value-policing comment for user/post');
+        } else {
+          // Subsequent value-policing comment: action.
+          const actionRaw = await settings.get('value_once_action');
+          const actionNorm = normalizeSelectSetting(actionRaw, 'reply');
+          const action = actionNorm === 'remove' ? 'remove' : 'reply';
+          console.log('Stage6.1: triggered; actionRaw=', actionRaw, 'normalized=', actionNorm, 'final=', action);
+
+          if (action === 'remove') {
+            const removed = await tryRemoveComment(context, comment.id);
+            console.log('Stage6.1: remove result=', removed);
+          } else {
+            const tpl =
+              ((await settings.get('value_once_reply_template')) as string | undefined) ??
+              'Hi u/{username} — please keep value feedback to **one comment per post**.';
+            const replyBody = renderTemplate(tpl, {
+              username: usernameForGuards,
+              subreddit: subreddit.name,
+            }).trim();
+
+            console.log('Stage6.1: replying len=', replyBody.length);
+
+            if (replyBody.length > 0) {
+              await submitAutoReplyWithRetry(context, comment.id, replyBody, usernameForGuards);
+            } else {
+              console.log('Stage6.1: reply skipped (empty after trim)');
+            }
+          }
+
+          // Stop further actions (prevents stacking Stage3 reply etc.)
+          return;
+        }
+      }
+
+      // 6.2 Dogpile / argument: too many comments on same post within a window
+      if (enableDogpile === true) {
+        const maxRaw = (await settings.get('dogpile_max_comments')) as number | undefined;
+        const windowRaw = (await settings.get('dogpile_window_minutes')) as number | undefined;
+
+        const maxComments = typeof maxRaw === 'number' && maxRaw > 0 ? maxRaw : 6;
+        const windowMinutes = typeof windowRaw === 'number' && windowRaw > 0 ? windowRaw : 30;
+        const windowMs = windowMinutes * 60 * 1000;
+
+        const key = dogpileKey(postIdForGuards, usernameForGuards);
+        const stamps = await getJsonKV<number[]>(context, key, []);
+
+        const pruned = stamps.filter((ts) => nowMs - ts <= windowMs);
+        pruned.push(nowMs);
+
+        await setJsonKV(context, key, pruned);
+
+        console.log(
+          'Stage6.2: dogpile count',
+          'key=',
+          key,
+          'count=',
+          pruned.length,
+          'max=',
+          maxComments,
+          'windowMin=',
+          windowMinutes
+        );
+
+        if (pruned.length > maxComments) {
+          const actionRaw = await settings.get('dogpile_action');
+          const action = normalizeSelectSetting(actionRaw, 'reply');
+          console.log('Stage6.2: triggered; action=', action);
+
+          if (action === 'remove') {
+            const removed = await tryRemoveComment(context, comment.id);
+            console.log('Stage6.2: remove result=', removed);
+          } else {
+            const tpl =
+              ((await settings.get('dogpile_reply_template')) as string | undefined) ??
+              'Hi u/{username} — please avoid back-and-forth arguments.';
+            const replyBody = renderTemplate(tpl, {
+              username: usernameForGuards,
+              subreddit: subreddit.name,
+            }).trim();
+
+            console.log('Stage6.2: replying len=', replyBody.length);
+
+            if (replyBody.length > 0) {
+              await submitAutoReplyWithRetry(context, comment.id, replyBody, usernameForGuards);
+            } else {
+              console.log('Stage6.2: reply skipped (empty after trim)');
+            }
+          }
+
+          return;
+        }
+      }
+    } else if (enableValueOnce || enableDogpile) {
+      console.log(
+        'Stage6: skipped (missing postId/username)',
+        'postId=',
+        postIdForGuards,
+        'username=',
+        usernameForGuards
+      );
+    }
+
+	    // ==========================
+	    // STAGE 3 – Auto reply logic
+	    // ==========================
 
     if (username) {
       const autoReplyEnabled = (await settings.get(
