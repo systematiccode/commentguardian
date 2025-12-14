@@ -4,16 +4,6 @@ CommentGuardian is a production-safety-first Devvit moderation bot focused on re
 
 ---
 
-## Critical development rules
-
-- `main.ts` is the last working base file
-- Do not remove, refactor, shorten, or reorganize existing code
-- Changes must be additive and minimal
-- Preserve all existing behavior, logging, and safeguards
-- Only add new features when explicitly requested
-
----
-
 ## What this bot does
 
 ### Comment classification
@@ -34,7 +24,7 @@ Classification results drive scoring, enforcement, and escalation logic.
 
 ---
 
-### Auto-reply system (Stage 3)
+### Auto-reply system
 - Configurable for:
   - First offense only
   - Repeat offense only
@@ -47,14 +37,14 @@ Classification results drive scoring, enforcement, and escalation logic.
 
 ---
 
-### Vote-based signals (Stage 5.4)
+### Vote-based signals
 - Vote jobs are scheduled and processed reliably
 - Feature can be enabled or disabled via settings
 - Safe to run alongside comment handlers
 
 ---
 
-### Anti-dogpiling and value-policing controls (Stage 6)
+### Anti-dogpiling and value-policing controls
 
 #### Value policing once per user per post
 - Prevents repeated value-policing by the same user in a single post
@@ -68,7 +58,7 @@ Classification results drive scoring, enforcement, and escalation logic.
 
 ---
 
-### Trade-count flair gate (newer integration)
+### Trade-count flair gate
 - Code includes a newer flair-gating integration
 - Moderator exemptions are supported
 - Policy thresholds and enforcement rules are still evolving
@@ -139,9 +129,10 @@ Common configurable areas include:
 
 ---
 
-## Future enhancements (optional)
+## Future enhancements
 
 - Finalize trade-count flair gate rules
 - Escalation tiers (warn → remove → stronger actions)
 - Expanded moderator diagnostics
 - Per-category action routing
+- Add UI via menu
